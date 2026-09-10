@@ -36,6 +36,237 @@ pub enum Command {
 
     /// Rank the interesting moments of a ride.
     Analyse(AnalyseArgs),
+
+    /// Stitch a .360 to an equirectangular video.
+    Convert(ConvertArgs),
+
+    /// Cut clips around the ride's interesting moments.
+    Clips(ClipsArgs),
+
+    /// List the video encoders this machine can really use.
+    ///
+    /// Hardware encoders are verified with a one-frame test encode, because
+    /// ffmpeg advertises them even with no matching GPU in the box and they
+    /// otherwise fail only once a real encode starts.
+    Encoders(EncodersArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ClipsArgs {
+    /// GoPro .360 or .mp4 file.
+    pub input: PathBuf,
+
+    /// Output directory. Defaults to <input stem>_highlights.
+    #[arg(short, long)]
+    pub outdir: Option<PathBuf>,
+
+    /// Moments to cut per metric.
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    pub top: usize,
+
+    /// Restrict to these metrics, comma separated.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub metric: Option<Vec<String>>,
+
+    /// Seconds of run-in before each moment.
+    #[arg(long, default_value_t = 6.0, value_name = "S")]
+    pub pre: f64,
+
+    /// Seconds after each moment.
+    #[arg(long, default_value_t = 4.0, value_name = "S")]
+    pub post: f64,
+
+    /// Merge clips that come within this of each other. Negative disables.
+    #[arg(long, default_value_t = 2.0, value_name = "S", allow_hyphen_values = true)]
+    pub merge_gap: f64,
+
+    /// Minimum separation between reported moments, in seconds.
+    #[arg(long, default_value_t = 5.0, value_name = "S")]
+    pub min_gap: f64,
+
+    /// Lean angle beyond which an excursion counts as a curve.
+    #[arg(long, default_value_t = 15.0, value_name = "DEG")]
+    pub curve_threshold: f64,
+
+    /// Length of the curve-density window, in seconds.
+    #[arg(long, default_value_t = 10.0, value_name = "S")]
+    pub window: f64,
+
+    /// Reject GPS fixes at or above this dilution of precision.
+    #[arg(long, default_value_t = 5.0, value_name = "DOP")]
+    pub max_dop: f64,
+
+    /// Overwrite clips that already exist.
+    #[arg(long)]
+    pub overwrite: bool,
+
+    /// Plan the clips and print them without writing anything.
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+
+    /// Path to the ffmpeg binary, if it is not on PATH.
+    #[arg(long, value_name = "PATH")]
+    pub ffmpeg: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ConvertArgs {
+    /// GoPro .360 file.
+    pub input: PathBuf,
+
+    /// Output path. Defaults to <input stem>_equirect.<mp4|mov>.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+
+    /// Quality target. A preset is a candidate list, not a fixed encoder: the
+    /// first one that works on this machine wins, so run `gmax encoders` to see
+    /// what each resolves to here.
+    #[arg(short = 'q', long, value_enum, default_value_t = PresetArg::High)]
+    pub quality: PresetArg,
+
+    /// Encode with this specific encoder, e.g. libx265 or hevc_nvenc.
+    #[arg(short = 'E', long, value_name = "NAME")]
+    pub encoder: Option<String>,
+
+    /// Rate-control value on the chosen encoder's own scale (CRF, CQ, QP, or
+    /// 0-100 for VideoToolbox and Media Foundation).
+    #[arg(long, value_name = "N")]
+    pub enc_quality: Option<u32>,
+
+    /// Restrict the encoder choice to hardware or software.
+    #[arg(long, value_enum)]
+    pub accel: Option<AccelArg>,
+
+    /// Which audio to keep. Ambisonic forces a MOV container.
+    #[arg(short = 'a', long, value_enum, default_value_t = AudioArg::Stereo)]
+    pub audio: AudioArg,
+
+    /// Level the horizon using the clip's mean gravity vector.
+    #[arg(long)]
+    pub level: bool,
+
+    /// Apply an explicit yaw:pitch:roll rotation in degrees.
+    ///
+    /// allow_hyphen_values, because every one of these is routinely negative
+    /// and clap would otherwise read "-45:118:0" as an unknown flag.
+    #[arg(long, value_name = "Y:P:R", conflicts_with = "level", allow_hyphen_values = true)]
+    pub rotate: Option<String>,
+
+    /// Turn the levelled view by this many degrees about the vertical.
+    ///
+    /// Levelling fixes which way is up but not which way the centre of the
+    /// frame looks; this chooses that, without disturbing the horizon.
+    #[arg(long, value_name = "DEG", allow_hyphen_values = true, default_value_t = 0.0)]
+    pub heading: f64,
+
+    /// Print the rotation --level would apply, and exit.
+    ///
+    /// Use it to share one rotation across every clip of a recording.
+    #[arg(long)]
+    pub print_rotation: bool,
+
+    /// Rotation order for the view transform.
+    ///
+    /// Defaults to pry rather than v360's own ypr so that yaw is applied last,
+    /// about the already-levelled vertical, leaving heading and levelling
+    /// independent.
+    #[arg(long, default_value = "pry")]
+    pub rorder: String,
+
+    /// Interpolation used by the projection transform.
+    #[arg(long, default_value = "lanczos")]
+    pub interp: String,
+
+    /// Output size as WxH. Defaults to the native angular resolution, which is
+    /// four cube faces across.
+    #[arg(long, value_name = "WxH")]
+    pub size: Option<String>,
+
+    /// Start this many seconds into the input.
+    #[arg(long, value_name = "S")]
+    pub ss: Option<f64>,
+
+    /// Encode only this many seconds.
+    #[arg(long, value_name = "S")]
+    pub duration: Option<f64>,
+
+    /// Write a single JPEG instead of a video, for checking framing quickly.
+    #[arg(long)]
+    pub preview: bool,
+
+    /// Embed chapter markers from an ffmetadata file, as written by
+    /// `gmax analyse --chapters`.
+    #[arg(long, value_name = "FILE")]
+    pub chapters: Option<PathBuf>,
+
+    /// Drop the GPMF telemetry track from the output.
+    #[arg(long)]
+    pub no_telemetry: bool,
+
+    /// ffmpeg filter threads.
+    #[arg(short = 'j', long, value_name = "N")]
+    pub jobs: Option<usize>,
+
+    /// Overwrite an existing output.
+    #[arg(long)]
+    pub overwrite: bool,
+
+    /// Print the ffmpeg command instead of running it.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Path to the ffmpeg binary, if it is not on PATH.
+    #[arg(long, value_name = "PATH")]
+    pub ffmpeg: Option<PathBuf>,
+
+    /// Re-test every encoder instead of using the cached result.
+    #[arg(long)]
+    pub reprobe: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresetArg {
+    /// Best available HEVC, hardware first.
+    High,
+    /// Software HEVC first: slowest, smallest transparent file.
+    Max,
+    /// Best available AV1: about half the size, less certain player support.
+    Av1,
+    /// ProRes 422 HQ, for handing to an editor.
+    Prores,
+    /// H.264, for maximum compatibility.
+    H264,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioArg {
+    Stereo,
+    Ambisonic,
+    Both,
+    None,
+}
+
+#[derive(Args, Debug)]
+pub struct EncodersArgs {
+    /// Restrict the listing to hardware or software encoders.
+    #[arg(long, value_enum)]
+    pub accel: Option<AccelArg>,
+
+    /// Re-test every encoder instead of using the cached result.
+    #[arg(long)]
+    pub reprobe: bool,
+
+    /// Path to the ffmpeg binary, if it is not on PATH.
+    #[arg(long, value_name = "PATH")]
+    pub ffmpeg: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelArg {
+    /// Hardware encoders only.
+    Gpu,
+    /// Software encoders only.
+    Cpu,
 }
 
 #[derive(Args, Debug)]

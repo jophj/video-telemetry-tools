@@ -21,7 +21,345 @@ fn run() -> Result<()> {
         Command::Gpx(args) => cmd_gpx(args, cli.quiet),
         Command::Merge(args) => cmd_merge(args, cli.quiet),
         Command::Analyse(args) => cmd_analyse(args, cli.quiet),
+        Command::Encoders(args) => cmd_encoders(args),
+        Command::Convert(args) => cmd_convert(args, cli.quiet),
+        Command::Clips(args) => cmd_clips(args, cli.quiet),
     }
+}
+
+fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
+    use gmax::ffmpeg::Ffmpeg;
+    use gmax::moments::{self, clips, MetricId, Options};
+
+    let mut file = gmax::mp4::Mp4::open(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let container_duration = file.duration_secs();
+    let gpmf = gmax::gpmf::from_mp4(&mut file)?;
+    let t = telemetry::compute(
+        &gpmf,
+        &telemetry::Options {
+            max_dop: args.max_dop,
+            ..Default::default()
+        },
+    )?;
+    for w in &t.warnings {
+        eprintln!("gmax: warning: {w}");
+    }
+
+    let metrics = match &args.metric {
+        None => MetricId::ALL.to_vec(),
+        Some(list) => list
+            .iter()
+            .map(|n| {
+                MetricId::parse(n.trim())
+                    .ok_or_else(|| anyhow::anyhow!("unknown metric {:?}", n.trim()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+
+    let samples = moments::samples_from_telemetry(&t);
+    let mut analysis = moments::analyse(
+        &samples,
+        &Options {
+            top: args.top,
+            min_gap_s: args.min_gap,
+            curve_threshold_deg: args.curve_threshold,
+            window_s: args.window,
+            metrics,
+            ..Default::default()
+        },
+    )?;
+    analysis.source = args.input.display().to_string();
+
+    let (planned, dropped) = clips::plan(
+        &analysis,
+        &clips::PlanOptions {
+            pre_s: args.pre,
+            post_s: args.post,
+            merge_gap_s: args.merge_gap,
+            duration_s: Some(container_duration),
+            ..Default::default()
+        },
+    );
+    if planned.is_empty() {
+        anyhow::bail!(
+            "no clips could be planned from {} moment(s); the ride may be too short or have no \
+             usable telemetry",
+            dropped.len()
+        );
+    }
+
+    let stem = args
+        .input
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ride".into());
+    let outdir = args
+        .outdir
+        .clone()
+        .unwrap_or_else(|| args.input.with_file_name(format!("{stem}_highlights")));
+    // A .360 clip keeps both lenses, so its extension stays .360.
+    let ext = args
+        .input
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".into());
+
+    if !quiet || args.dry_run {
+        println!(
+            "{} clip(s) planned from {} moment(s), into {}",
+            planned.len(),
+            planned.iter().map(|c| c.moments.len()).sum::<usize>(),
+            outdir.display()
+        );
+        for c in &planned {
+            println!(
+                "  {:>8.2}..{:<8.2} ({:>5.2}s)  {}",
+                c.start_s,
+                c.end_s,
+                c.duration_s(),
+                c.moments
+                    .iter()
+                    .map(|m| m.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for d in &dropped {
+            println!("  skipped {}: {}", d.moment.label(), d.reason);
+        }
+    }
+    if args.dry_run {
+        return Ok(());
+    }
+
+    let ff = Ffmpeg::find(args.ffmpeg.as_deref())?;
+    let layout = gmax::render::inspect(&ff, &args.input)?;
+    std::fs::create_dir_all(&outdir)
+        .with_context(|| format!("creating {}", outdir.display()))?;
+
+    let mut written = Vec::new();
+    for c in &planned {
+        let path = outdir.join(format!("{}.{ext}", c.name(&stem)));
+        if path.exists() && !args.overwrite {
+            if !quiet {
+                println!("skipping {} (already exists)", path.display());
+            }
+            written.push((c, path));
+            continue;
+        }
+        let cmd = gmax::render::clip_args(
+            &layout,
+            &args.input,
+            &path,
+            c.start_s,
+            c.duration_s(),
+            args.overwrite,
+        );
+        ff.run(&cmd)
+            .with_context(|| format!("cutting {}", path.display()))?;
+        if !quiet {
+            println!("wrote {}", path.display());
+        }
+        written.push((c, path));
+    }
+
+    // A manifest, so the clips can be traced back to the moments that chose them.
+    let manifest = serde_json::json!({
+        "source": args.input.display().to_string(),
+        "sourceDurationSeconds": container_duration,
+        "window": { "preSeconds": args.pre, "postSeconds": args.post, "mergeGapSeconds": args.merge_gap },
+        "clips": written.iter().map(|(c, path)| serde_json::json!({
+            "file": path.file_name().map(|f| f.to_string_lossy().to_string()),
+            "startSeconds": c.start_s,
+            "endSeconds": c.end_s,
+            "durationSeconds": c.duration_s(),
+            "moments": c.moments.iter().map(|m| serde_json::json!({
+                "metric": m.metric.slug(),
+                "rank": m.entry.rank,
+                "label": m.label(),
+                "value": m.entry.value,
+                "unit": m.metric.unit(),
+                "videoTimeSeconds": m.entry.video_time_s,
+                "lat": m.entry.pos.map(|(lat, _)| lat),
+                "lon": m.entry.pos.map(|(_, lon)| lon),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "dropped": dropped.iter().map(|d| serde_json::json!({
+            "label": d.moment.label(),
+            "reason": d.reason,
+        })).collect::<Vec<_>>(),
+    });
+    let manifest_path = outdir.join(format!("{stem}_highlights.json"));
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    if !quiet {
+        println!("wrote {}", manifest_path.display());
+    }
+    Ok(())
+}
+
+fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
+    use gmax::cli::{AccelArg, AudioArg, PresetArg};
+    use gmax::ffmpeg::{encoders, Ffmpeg, Kind, Preset};
+    use gmax::render::{self, Audio, ConvertOptions, Rotation};
+
+    // The rotation comes from the telemetry, so it is known before ffmpeg is
+    // needed at all -- which is why --print-rotation works without it.
+    let mut rotation = if let Some(spec) = &args.rotate {
+        Some(Rotation::parse(spec)?)
+    } else if args.level || args.print_rotation {
+        let (mean, n) = render::mean_gravity(&args.input)?;
+        let r = render::level_from_gravity(mean)?;
+        if !quiet && !args.print_rotation {
+            println!("levelling from {n} gravity samples: {r}");
+        }
+        Some(r)
+    } else {
+        None
+    };
+    // Heading turns the levelled view about the vertical. With rorder=pry the
+    // yaw is applied last, so this does not disturb the horizon.
+    if args.heading != 0.0 {
+        let mut r = rotation.unwrap_or_default();
+        r.yaw += args.heading;
+        rotation = Some(r);
+    }
+
+    if args.print_rotation {
+        println!("{}", rotation.unwrap_or_default());
+        return Ok(());
+    }
+
+    let ff = Ffmpeg::find(args.ffmpeg.as_deref())?;
+    let layout = render::inspect(&ff, &args.input)?;
+
+    let size = match &args.size {
+        None => None,
+        Some(spec) => {
+            let (w, h) = spec
+                .split_once(['x', 'X'])
+                .ok_or_else(|| anyhow::anyhow!("--size wants WxH, e.g. 3840x1920"))?;
+            Some((
+                w.trim().parse().context("--size width")?,
+                h.trim().parse().context("--size height")?,
+            ))
+        }
+    };
+
+    let opts = ConvertOptions {
+        preset: match args.quality {
+            PresetArg::High => Preset::High,
+            PresetArg::Max => Preset::Max,
+            PresetArg::Av1 => Preset::Av1,
+            PresetArg::Prores => Preset::Prores,
+            PresetArg::H264 => Preset::H264,
+        },
+        encoder: args.encoder.clone(),
+        quality: args.enc_quality,
+        accel: args.accel.map(|a| match a {
+            AccelArg::Gpu => Kind::Gpu,
+            AccelArg::Cpu => Kind::Cpu,
+        }),
+        audio: match args.audio {
+            AudioArg::Stereo => Audio::Stereo,
+            AudioArg::Ambisonic => Audio::Ambisonic,
+            AudioArg::Both => Audio::Both,
+            AudioArg::None => Audio::None,
+        },
+        keep_telemetry: !args.no_telemetry,
+        rotation,
+        level: args.level,
+        rorder: args.rorder.clone(),
+        interp: args.interp.clone(),
+        size,
+        start_s: args.ss,
+        duration_s: args.duration,
+        preview: args.preview,
+        jobs: args.jobs,
+        chapters: args.chapters.clone(),
+        overwrite: args.overwrite,
+    };
+
+    let survey = encoders::survey(&ff, args.reprobe);
+    let encoder = render::choose_encoder(&survey, &opts)?;
+
+    let output = match &args.out {
+        Some(p) => p.clone(),
+        None => {
+            let ext = if args.preview {
+                "jpg"
+            } else {
+                render::container_for(encoder, opts.audio)
+            };
+            let stem = args
+                .input
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "out".into());
+            args.input
+                .with_file_name(format!("{stem}_equirect.{ext}"))
+        }
+    };
+
+    let vaapi = ff.vaapi_device();
+    let cmd = render::convert_args(
+        &layout,
+        &args.input,
+        &output,
+        encoder,
+        vaapi.as_deref(),
+        &opts,
+    );
+
+    if args.dry_run {
+        println!("{} {}", ff.ffmpeg.display(), shell_join(&cmd));
+        return Ok(());
+    }
+
+    let (w, h) = opts.size.unwrap_or_else(|| layout.geometry.native_output());
+    if !quiet {
+        println!(
+            "stitching {} to {w}x{h} with {} ({})",
+            args.input.display(),
+            encoder.name,
+            encoder.kind.as_str()
+        );
+    }
+    ff.run_streaming(&cmd)?;
+    if !quiet {
+        println!("wrote {}", output.display());
+    }
+    Ok(())
+}
+
+/// Quote a command for display, so a dry run can be pasted into a shell.
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.chars()
+                .all(|c| c.is_alphanumeric() || "-_./:=+".contains(c))
+            {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cmd_encoders(args: &gmax::cli::EncodersArgs) -> Result<()> {
+    use gmax::cli::AccelArg;
+    use gmax::ffmpeg::{encoders, Ffmpeg, Kind};
+
+    let ff = Ffmpeg::find(args.ffmpeg.as_deref())?;
+    let accel = args.accel.map(|a| match a {
+        AccelArg::Gpu => Kind::Gpu,
+        AccelArg::Cpu => Kind::Cpu,
+    });
+    let survey = encoders::survey(&ff, args.reprobe);
+    print!("{}", survey.render(accel));
+    Ok(())
 }
 
 fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
