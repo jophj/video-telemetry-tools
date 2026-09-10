@@ -395,3 +395,78 @@ fn analyses_the_reference_clip() {
     assert!(lateral.entries[0].value.abs() > 0.4, "peak cornering load looks low");
     assert!(lateral.entries[0].value.abs() < 1.5, "peak cornering load looks impossible");
 }
+
+#[test]
+fn chapters_are_shifted_and_clipped_onto_a_segment() {
+    // Chapters are written in the source's time base. Embedding them in a
+    // segment cut with --ss without adjustment puts a 25-second file's markers
+    // twenty minutes in, because ffmpeg takes the timestamps literally.
+    let text = "\
+;FFMETADATA1
+title=GS010527
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=100000
+END=110000
+title=Before the segment
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=950000
+END=968000
+title=Straddles the start
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=970000
+END=975000
+title=Inside
+
+[CHAPTER]
+TIMEBASE=1/1000
+START=1200000
+END=1210000
+title=After the segment
+";
+    // The segment runs 955..980 s.
+    let out = gmax::moments::clips::shift_ffmetadata(text, 955.0, Some(25.0));
+
+    // The file header survives.
+    assert!(out.starts_with(";FFMETADATA1"));
+    assert!(out.contains("title=GS010527"));
+
+    // Only the two overlapping chapters remain.
+    assert_eq!(out.matches("[CHAPTER]").count(), 2, "got:\n{out}");
+    assert!(!out.contains("Before the segment"));
+    assert!(!out.contains("After the segment"));
+
+    // The straddling one begins before the segment does, so it is trimmed to
+    // the segment's start and rebased to zero.
+    assert!(out.contains("title=Straddles the start"));
+    assert!(out.contains("START=0\n"), "got:\n{out}");
+    assert!(out.contains("END=13000\n"), "got:\n{out}");
+
+    // The wholly-inside one keeps its length, shifted.
+    assert!(out.contains("START=15000\n"), "got:\n{out}");
+    assert!(out.contains("END=20000\n"), "got:\n{out}");
+
+    // Every chapter ends up inside the segment.
+    for line in out.lines() {
+        for prefix in ["START=", "END="] {
+            if let Some(v) = line.strip_prefix(prefix) {
+                let ms: i64 = v.trim().parse().unwrap();
+                assert!((0..=25_000).contains(&ms), "{line} is outside the segment");
+            }
+        }
+    }
+}
+
+#[test]
+fn chapters_are_untouched_without_a_duration_limit() {
+    let text = ";FFMETADATA1\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=10000\nEND=20000\ntitle=x\n";
+    // Only a start offset: everything after it is kept, shifted.
+    let out = gmax::moments::clips::shift_ffmetadata(text, 5.0, None);
+    assert!(out.contains("START=5000\n"), "got:\n{out}");
+    assert!(out.contains("END=15000\n"), "got:\n{out}");
+}

@@ -133,6 +133,27 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     use gmax::ffmpeg::Ffmpeg;
     use gmax::moments::{self, clips, MetricId, Options};
 
+    // Validated before any I/O, so a mistyped metric is reported as one.
+    let metrics = match &args.metric {
+        None => MetricId::ALL.to_vec(),
+        Some(list) => list
+            .iter()
+            .map(|n| {
+                MetricId::parse(n.trim()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown metric {:?}. Valid: {}",
+                        n.trim(),
+                        MetricId::ALL
+                            .iter()
+                            .map(|m| m.slug())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+
     let mut file = gmax::mp4::Mp4::open(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let container_duration = file.duration_secs();
@@ -147,17 +168,6 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     for w in &t.warnings {
         eprintln!("gmax: warning: {w}");
     }
-
-    let metrics = match &args.metric {
-        None => MetricId::ALL.to_vec(),
-        Some(list) => list
-            .iter()
-            .map(|n| {
-                MetricId::parse(n.trim())
-                    .ok_or_else(|| anyhow::anyhow!("unknown metric {:?}", n.trim()))
-            })
-            .collect::<Result<Vec<_>>>()?,
-    };
 
     let samples = moments::samples_from_telemetry(&t);
     let mut analysis = moments::analyse(
@@ -403,6 +413,42 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
         }
     };
 
+    // Chapters are written in the source's time base, so a trimmed output needs
+    // them shifted; ffmpeg takes the timestamps literally.
+    let mut opts = opts;
+    let _shifted_chapters; // keeps the temporary file alive until ffmpeg has run
+    if let Some(path) = &opts.chapters {
+        if opts.start_s.is_some() || opts.duration_s.is_some() {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let shifted = gmax::moments::clips::shift_ffmetadata(
+                &text,
+                opts.start_s.unwrap_or(0.0),
+                opts.duration_s,
+            );
+            let temp = std::env::temp_dir().join(format!(
+                "gmax-chapters-{}.txt",
+                std::process::id()
+            ));
+            std::fs::write(&temp, &shifted)
+                .with_context(|| format!("writing {}", temp.display()))?;
+            if !quiet {
+                let kept = shifted.matches("[CHAPTER]").count();
+                let total = text.matches("[CHAPTER]").count();
+                println!(
+                    "chapters: {kept} of {total} fall inside the requested segment, shifted to \
+                     start at zero"
+                );
+            }
+            opts.chapters = Some(temp.clone());
+            _shifted_chapters = Some(temp);
+        } else {
+            _shifted_chapters = None;
+        }
+    } else {
+        _shifted_chapters = None;
+    }
+
     let vaapi = ff.vaapi_device();
     let cmd = render::convert_args(
         &layout,
@@ -468,6 +514,37 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
     use gmax::cli::AccelSourceArg;
     use gmax::moments::{self, clips, AccelSource, MetricId};
 
+    // Arguments are validated before any I/O, so a mistyped metric is reported
+    // as a mistyped metric rather than as whatever the input file happens to
+    // fail at first.
+    let metrics = match &args.metric {
+        None => MetricId::ALL.to_vec(),
+        Some(list) => {
+            let mut out = Vec::new();
+            for name in list {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                match MetricId::parse(name) {
+                    Some(m) => out.push(m),
+                    None => anyhow::bail!(
+                        "unknown metric {name:?}. Valid: {}",
+                        MetricId::ALL
+                            .iter()
+                            .map(|m| m.slug())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+            if out.is_empty() {
+                anyhow::bail!("--metric was empty");
+            }
+            out
+        }
+    };
+
     let ext = args
         .input
         .extension()
@@ -516,34 +593,6 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
                 args.input.display().to_string(),
                 Vec::new(),
             )
-        }
-    };
-
-    let metrics = match &args.metric {
-        None => MetricId::ALL.to_vec(),
-        Some(list) => {
-            let mut out = Vec::new();
-            for name in list {
-                let name = name.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                match MetricId::parse(name) {
-                    Some(m) => out.push(m),
-                    None => anyhow::bail!(
-                        "unknown metric {name:?}. Valid: {}",
-                        MetricId::ALL
-                            .iter()
-                            .map(|m| m.slug())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                }
-            }
-            if out.is_empty() {
-                anyhow::bail!("--metric was empty");
-            }
-            out
         }
     };
 

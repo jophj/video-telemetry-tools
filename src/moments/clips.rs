@@ -330,3 +330,84 @@ pub fn write_cue_csv(clips: &[Clip]) -> String {
     }
     out
 }
+
+/// Shift and clip an ffmetadata chapter file onto a trimmed segment.
+///
+/// Chapters are written in the source's own time base, so embedding them in a
+/// segment cut with `--ss`/`--duration` without adjustment puts a 25-second
+/// file's markers 20 minutes in. ffmpeg will not do this for us: it takes the
+/// timestamps literally.
+///
+/// Chapters entirely outside the segment are dropped and one straddling an edge
+/// is trimmed to it. Note that a container stores chapters as a contiguous
+/// tiling, so a player will show each one running until the next begins
+/// regardless of the gaps here.
+pub fn shift_ffmetadata(text: &str, start_s: f64, duration_s: Option<f64>) -> String {
+    let start_ms = (start_s * 1000.0).round() as i64;
+    let end_ms = duration_s.map(|d| start_ms + (d * 1000.0).round() as i64);
+
+    let mut out = String::new();
+    // A chapter block accumulates until its bounds are known, then is emitted
+    // or discarded as a whole.
+    let mut block: Vec<String> = Vec::new();
+    let mut in_chapter = false;
+    let mut chapter_start: Option<i64> = None;
+    let mut chapter_end: Option<i64> = None;
+
+    let flush = |out: &mut String,
+                 block: &mut Vec<String>,
+                 start: &mut Option<i64>,
+                 end: &mut Option<i64>| {
+        if block.is_empty() {
+            return;
+        }
+        let (Some(s), Some(e)) = (*start, *end) else {
+            block.clear();
+            *start = None;
+            *end = None;
+            return;
+        };
+        let lo = s.max(start_ms);
+        let hi = match end_ms {
+            Some(limit) => e.min(limit),
+            None => e,
+        };
+        if hi > lo {
+            for line in block.iter() {
+                if line.starts_with("START=") {
+                    out.push_str(&format!("START={}\n", lo - start_ms));
+                } else if line.starts_with("END=") {
+                    out.push_str(&format!("END={}\n", hi - start_ms));
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        block.clear();
+        *start = None;
+        *end = None;
+    };
+
+    for line in text.lines() {
+        if line.trim() == "[CHAPTER]" {
+            flush(&mut out, &mut block, &mut chapter_start, &mut chapter_end);
+            in_chapter = true;
+            block.push(line.to_string());
+            continue;
+        }
+        if !in_chapter {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("START=") {
+            chapter_start = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("END=") {
+            chapter_end = v.trim().parse().ok();
+        }
+        block.push(line.to_string());
+    }
+    flush(&mut out, &mut block, &mut chapter_start, &mut chapter_end);
+    out
+}
