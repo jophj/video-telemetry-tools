@@ -333,3 +333,165 @@ impl Source {
         }
     }
 }
+
+/// Build the viewer's JSON from a telemetry CSV.
+///
+/// The viewer is usually pointed at a stitched or proxy rendering, which has no
+/// GPMF track of its own, so the channels have to come from the CSV written
+/// earlier. It also means a CSV that has been edited or merged can be inspected
+/// without re-deriving anything.
+pub fn json_from_csv(
+    text: &str,
+    video: Option<&str>,
+    video_duration_s: Option<f64>,
+) -> anyhow::Result<String> {
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the CSV is empty"))?
+        .split(',')
+        .map(|h| h.trim())
+        .collect();
+    let rows: Vec<Vec<&str>> = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split(',').collect())
+        .collect();
+    if rows.is_empty() {
+        anyhow::bail!("the CSV has a header but no rows");
+    }
+
+    let index = |name: &str| header.iter().position(|h| *h == name);
+    // Spelled out rather than a closure: an inferred closure lifetime here ties
+    // the returned &str to the borrow of `row` instead of to the input text.
+    fn cell<'a>(row: &[&'a str], i: Option<usize>) -> Option<&'a str> {
+        i.and_then(|i| row.get(i).copied())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+    fn number(row: &[&str], i: Option<usize>) -> Option<f64> {
+        cell(row, i).and_then(|s| s.parse().ok())
+    }
+
+    let i_time = index("time_s");
+    let i_utc = index("utc");
+    let i_valid = index("gps_valid");
+
+    // The viewer's channel keys, and the CSV column each is read from.
+    let channels: [(&str, Option<usize>, usize); 16] = [
+        ("lean", index("lean_deg"), 2),
+        ("leanrate", index("lean_rate_dps"), 1),
+        ("pitch", index("pitch_deg"), 2),
+        ("pitchrate", index("pitch_rate_dps"), 1),
+        ("yaw", index("yaw_rate_dps"), 1),
+        ("speed", index("speed_kmh"), 1),
+        ("alon", index("accel_lon_g"), 3),
+        ("alat", index("accel_lat_g"), 3),
+        ("avert", index("accel_vert_g"), 3),
+        ("atot", index("accel_total_g"), 3),
+        ("alt", index("alt_m"), 1),
+        ("course", index("course_deg"), 1),
+        ("lat", index("lat"), 6),
+        ("lon", index("lon"), 6),
+        ("temp", index("imu_temp_c"), 1),
+        ("dop", index("gps_dop"), 2),
+    ];
+
+    // Measure the rate from the timestamps rather than assuming it, so a CSV
+    // at any cadence renders correctly.
+    let times: Vec<f64> = rows.iter().filter_map(|r| number(r, i_time)).collect();
+    let hz = if times.len() > 1 {
+        let span = times[times.len() - 1] - times[0];
+        if span > 0.0 {
+            (times.len() - 1) as f64 / span
+        } else {
+            30.0
+        }
+    } else {
+        30.0
+    };
+    let duration = times.last().copied().unwrap_or(0.0);
+    let valid_count = rows
+        .iter()
+        .filter(|r| cell(r, i_valid) == Some("1"))
+        .count();
+
+    let mut out = String::new();
+    out.push_str(&format!("{{\"n\":{}", rows.len()));
+    out.push_str(&format!(",\"hz\":{hz:.5}"));
+    out.push_str(&format!(",\"hz_nominal\":{}", hz.round()));
+    out.push_str(&format!(
+        ",\"hz_note\":{}",
+        json_string(&format!(
+            "{hz:.5} Hz, measured from the CSV's own time_s column"
+        ))
+    ));
+    out.push_str(&format!(",\"dur_s\":{duration:.3}"));
+    match rows.first().and_then(|r| cell(r, i_utc)) {
+        Some(t) => out.push_str(&format!(",\"start_utc\":{}", json_string(t))),
+        None => out.push_str(",\"start_utc\":null"),
+    }
+    out.push_str(",\"start_utc_is_fallback\":false");
+    out.push_str(&format!(
+        ",\"gps_fix_pct\":{:.1}",
+        100.0 * valid_count as f64 / rows.len() as f64
+    ));
+    // A CSV carries no record of how its lean sign was decided.
+    out.push_str(",\"lean_sign\":null");
+
+    out.push_str(",\"gps_valid\":[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push(if cell(row, i_valid) == Some("1") { '1' } else { '0' });
+    }
+    out.push(']');
+
+    let mut missing: Vec<&str> = Vec::new();
+    out.push_str(",\"ch\":{");
+    for (ci, (key, column, dp)) in channels.iter().enumerate() {
+        if ci > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{}:[", json_string(key)));
+        let mut any = false;
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            match number(row, *column) {
+                Some(v) if v.is_finite() => {
+                    any = true;
+                    out.push_str(&format!("{v:.*}", dp));
+                }
+                _ => out.push_str("null"),
+            }
+        }
+        out.push(']');
+        if !any {
+            missing.push(key);
+        }
+    }
+    out.push('}');
+
+    out.push_str(",\"missing\":[");
+    for (i, m) in missing.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_string(m));
+    }
+    out.push(']');
+
+    out.push_str(&format!(
+        ",\"video\":{}",
+        video.map(json_string).unwrap_or_else(|| "null".into())
+    ));
+    out.push_str(",\"clip\":null");
+    match video_duration_s {
+        Some(d) => out.push_str(&format!(",\"video_dur_s\":{d:.3}")),
+        None => out.push_str(",\"video_dur_s\":null"),
+    }
+    out.push('}');
+    Ok(out)
+}

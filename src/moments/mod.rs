@@ -366,7 +366,7 @@ pub fn detect_curves(samples: &[Sample], threshold: f64) -> Vec<Curve> {
     let mut sign = 0i8;
     let mut peak: Option<(usize, f64)> = None;
 
-    let mut close = |sign: &mut i8, peak: &mut Option<(usize, f64)>, curves: &mut Vec<Curve>| {
+    let close = |sign: &mut i8, peak: &mut Option<(usize, f64)>, curves: &mut Vec<Curve>| {
         if let Some((i, lean)) = *peak {
             if lean.abs() >= threshold {
                 curves.push(Curve {

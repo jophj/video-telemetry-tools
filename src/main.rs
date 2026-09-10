@@ -24,7 +24,109 @@ fn run() -> Result<()> {
         Command::Encoders(args) => cmd_encoders(args),
         Command::Convert(args) => cmd_convert(args, cli.quiet),
         Command::Clips(args) => cmd_clips(args, cli.quiet),
+        Command::Viewer(args) => cmd_viewer(args),
     }
+}
+
+fn cmd_viewer(args: &gmax::cli::ViewerArgs) -> Result<()> {
+    // The viewer needs the telemetry as its own JSON. Three ways to get it, in
+    // order of preference: an explicit file, the video's own GPMF track, or a
+    // sibling CSV left by `gmax telemetry`.
+    let json = if let Some(path) = &args.telemetry {
+        telemetry_json_from(path, args.max_dop, Some(&args.video))?
+    } else {
+        match telemetry_json_from(&args.video, args.max_dop, Some(&args.video)) {
+            Ok(j) => j,
+            Err(video_err) => {
+                // A stitched proxy often has no telemetry of its own, so look
+                // for the CSV alongside it.
+                let stem = gmax::cli::with_extension(&args.video, "telemetry.csv");
+                let alt = strip_suffix_variant(&args.video);
+                let candidate = [Some(stem), alt]
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p.exists());
+                match candidate {
+                    Some(p) => {
+                        eprintln!("gmax: using telemetry from {}", p.display());
+                        telemetry_json_from(&p, args.max_dop, Some(&args.video))?
+                    }
+                    None => return Err(video_err.context(
+                        "no telemetry found: pass --telemetry, or run `gmax telemetry` on the \
+                         original .360 first",
+                    )),
+                }
+            }
+        }
+    };
+
+    gmax::viewer::serve(gmax::viewer::Options {
+        video: args.video.clone(),
+        telemetry_json: json,
+        port: args.port,
+        open_browser: !args.no_open,
+    })
+}
+
+/// `GS010527_proxy.mp4` -> `GS010527.telemetry.csv`.
+///
+/// A viewer is usually pointed at a stitched or proxy rendering, whose stem
+/// carries a suffix the telemetry file does not have.
+fn strip_suffix_variant(video: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stem = video.file_stem()?.to_string_lossy().to_string();
+    for suffix in ["_equirect", "_proxy", "_stitched", "_hud"] {
+        if let Some(base) = stem.strip_suffix(suffix) {
+            return Some(video.with_file_name(format!("{base}.telemetry.csv")));
+        }
+    }
+    None
+}
+
+/// Render the viewer's JSON from a video, a CSV or a GPX.
+fn telemetry_json_from(
+    path: &std::path::Path,
+    max_dop: f64,
+    video: Option<&std::path::Path>,
+) -> Result<String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let video_name = video
+        .and_then(|v| v.file_name())
+        .map(|s| s.to_string_lossy().to_string());
+
+    if ext == "csv" {
+        // The viewer's contract is built from the CSV's own columns.
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        return gmax::telemetry::output::json_from_csv(&text, video_name.as_deref(), None)
+            .with_context(|| format!("converting {}", path.display()));
+    }
+
+    let mut file = gmax::mp4::Mp4::open(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let duration = file.duration_secs();
+    let gpmf = gmax::gpmf::from_mp4(&mut file)?;
+    let t = telemetry::compute(
+        &gpmf,
+        &telemetry::Options {
+            max_dop,
+            ..Default::default()
+        },
+    )?;
+    for w in &t.warnings {
+        eprintln!("gmax: warning: {w}");
+    }
+    let mut out = Vec::new();
+    gmax::telemetry::output::write_json_to(
+        &t,
+        &mut out,
+        video_name.as_deref(),
+        Some(duration),
+        path.file_name().map(|s| s.to_string_lossy().to_string()).as_deref(),
+    )?;
+    Ok(String::from_utf8(out)?)
 }
 
 fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {

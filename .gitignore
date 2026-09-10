@@ -1,6 +1,7 @@
 /target
 /sources
 *.telemetry.csv
+!sources/GS010527.prototype-telemetry.csv
 *.gpx
 *.merged.gpx
 *_equirect.mp4

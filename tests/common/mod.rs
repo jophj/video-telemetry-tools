@@ -13,7 +13,17 @@ use std::path::{Path, PathBuf};
 pub const REFERENCE_360: &str = "sources/GS010527.360";
 
 /// The prototype's telemetry CSV for the same clip, for parity checks.
-pub const REFERENCE_CSV: &str = "sources/GS010527.telemetry.csv";
+///
+/// Deliberately *not* named `GS010527.telemetry.csv`: that is exactly where
+/// `gmax telemetry` writes its own output by default, so the two would collide
+/// and the reference would be silently overwritten by a routine command.
+/// Regenerate with:
+///
+/// ```text
+/// python3 prototypes/gopro-telemetry.py sources/GS010527.360 \
+///     -o sources/GS010527.prototype-telemetry.csv
+/// ```
+pub const REFERENCE_CSV: &str = "sources/GS010527.prototype-telemetry.csv";
 
 /// A MotionRecord ride export: the upstream form of an external GPS source.
 pub const REFERENCE_RIDE_JSON: &str = "sources/66e6c51d_kurvenfokus.json";

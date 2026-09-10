@@ -43,12 +43,38 @@ pub enum Command {
     /// Cut clips around the ride's interesting moments.
     Clips(ClipsArgs),
 
+    /// Serve the browser telemetry viewer.
+    Viewer(ViewerArgs),
+
     /// List the video encoders this machine can really use.
     ///
     /// Hardware encoders are verified with a one-frame test encode, because
     /// ffmpeg advertises them even with no matching GPU in the box and they
     /// otherwise fail only once a real encode starts.
     Encoders(EncodersArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ViewerArgs {
+    /// The video to play. A stitched equirectangular file, or a proxy of one.
+    pub video: PathBuf,
+
+    /// Telemetry to overlay. Defaults to the telemetry inside the video, or a
+    /// sibling CSV when the video has none.
+    #[arg(long, value_name = "FILE")]
+    pub telemetry: Option<PathBuf>,
+
+    /// Port to listen on.
+    #[arg(long, default_value_t = 8360)]
+    pub port: u16,
+
+    /// Do not open a browser.
+    #[arg(long)]
+    pub no_open: bool,
+
+    /// Reject GPS fixes at or above this dilution of precision.
+    #[arg(long, default_value_t = 5.0, value_name = "DOP")]
+    pub max_dop: f64,
 }
 
 #[derive(Args, Debug)]

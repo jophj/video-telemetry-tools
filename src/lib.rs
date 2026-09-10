@@ -14,5 +14,6 @@ pub mod moments;
 pub mod mp4;
 pub mod render;
 pub mod telemetry;
+pub mod viewer;
 
 pub use fourcc::FourCc;

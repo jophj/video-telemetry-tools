@@ -256,7 +256,7 @@
         </div>
         <div class="row">
           <label style="min-width:96px">LEAN SIGN</label>
-          <label><input type="checkbox" id="raw"> raw CSV sign — lean, yaw rate
+          <label><input type="checkbox" id="flipLateral"> flip lateral sign — for CSVs from the old Python tool
             and lateral g as <code>gopro-telemetry.py</code> wrote them.
             Off (default) corrects the documented inversion, so + is a right-hand turn.</label>
         </div>
@@ -362,7 +362,12 @@ function initGL(){
    forward horizon and the horizon is rolled, so a centred view is pure tarmac.
    Hence a default pitch, and a roll axis -- without roll, footage like this
    cannot be levelled by dragging at all. */
-const DEFAULT_VIEW = {yaw:0, pitch:72*Math.PI/180, roll:0, fov:95};
+/* Pitch 0 looks straight ahead, which is correct for a levelled stitch --
+   `gmax convert --level`. The Python viewer defaulted to 72 degrees because
+   nothing levelled the output: its equirect centre sat that far into the
+   tarmac. Point this at an unlevelled file and the pitch control is still
+   there. */
+const DEFAULT_VIEW = {yaw:0, pitch:0, roll:0, fov:95};
 const view = {...DEFAULT_VIEW};
 
 function camMatrix(){
@@ -463,21 +468,29 @@ document.getElementById('recentre').onclick = () => {
    Telemetry
    ===================================================================== */
 let T = null;                       // the loaded payload
-const A = {off:0, trim:0, raw:false, scale:1};    // alignment state
+const A = {off:0, trim:0, flipLateral:false, scale:1};    // alignment state
 
-/* gopro-telemetry.py's lean_deg is sign-inverted: its calibration fixes the
-   lean sign against the gyro's yaw rate, and that lateral axis is itself
-   flipped, so positive lean_deg is actually a LEFT turn.  Checked against GPS
-   course rate (r = -0.33 raw, and r = +0.95 against the camera's own yaw rate,
-   i.e. self-consistent but absolutely wrong) -- see README, "The lean sign
-   disagreement".  yaw_rate_dps and accel_lat_g ride the same flipped axis, so
-   all three are corrected together.  A.raw shows the CSV untouched.
-   accel_lon_g and pitch_deg are NOT affected: the forward axis was settled
-   against GPS dv/dt, which is unambiguous. */
+/* The lateral channels -- lean, lean rate, yaw rate and lateral acceleration
+   -- are all signed positive-to-the-right by gmax, so nothing needs correcting
+   here and this flip is off by default.
+
+   It used to be on. gopro-telemetry.py signed lean against the gyro's yaw
+   rate, whose convention is the opposite one (gravity points up and the sensor
+   frame is right-handed, so a right turn is a NEGATIVE rotation about the up
+   axis), which made positive lean_deg a left turn: r = -0.33 against GPS
+   course rate while agreeing with its own yaw rate at r = +0.95, so
+   self-consistent but absolutely wrong. That is now fixed at source, and
+   confirmed two ways -- gmax reports the sign decision it made and its
+   confidence, and the phone's independently measured lean angle correlates
+   POSITIVELY with the camera's.
+
+   Keep the switch for CSVs written by the old Python tool. */
 const LATERAL = new Set(['lean', 'leanrate', 'yaw', 'alat']);
-const sign = () => A.raw ? 1 : -1;
+const sign = () => A.flipLateral ? -1 : 1;
 
-const KEY = 'gopro-telemetry-viewer/align';
+/* Bumped from /align so that saved state from the Python viewer, which stored
+   the old always-on flip, does not resurrect it. */
+const KEY = 'gopro-telemetry-viewer/align2';
 function saveAlign(){
   try{ localStorage.setItem(KEY, JSON.stringify(A)); }catch(e){}
 }
@@ -485,7 +498,7 @@ function loadAlign(){
   try{
     const s = JSON.parse(localStorage.getItem(KEY) || '{}');
     for(const k of ['off','trim','scale']) if(typeof s[k] === 'number') A[k] = s[k];
-    if(typeof s.raw === 'boolean') A.raw = s.raw;
+    if(typeof s.flipLateral === 'boolean') A.flipLateral = s.flipLateral;
   }catch(e){}
 }
 
@@ -792,7 +805,7 @@ el('offZero').onclick   = () => setOff(0);
 el('trimZero').onclick  = () => setTrim(0);
 el('scaleZero').onclick = () => setScale(1);
 el('raw').addEventListener('change', e => {
-  A.raw = e.target.checked; saveAlign();
+  A.flipLateral = e.target.checked; saveAlign();
   peakL = 0; peakR = 0; gTrail.length = 0; refresh();
 });
 
@@ -851,7 +864,7 @@ async function boot(){
   el('off').value = A.off;     el('offNum').value = A.off.toFixed(3);
   el('trim').value = A.trim;   el('trimNum').value = A.trim.toFixed(1);
   el('scale').value = A.scale; el('scaleNum').value = A.scale.toFixed(5);
-  el('raw').checked = A.raw;
+  el('flipLateral').checked = A.flipLateral;
   showHz();
 
   el('note').innerHTML =
