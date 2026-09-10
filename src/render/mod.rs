@@ -685,3 +685,101 @@ pub fn choose_encoder(
         )
     })
 }
+
+/// Facts about the source needed to tag the output.
+#[derive(Debug, Clone, Default)]
+pub struct SourceInfo {
+    /// Camera model, from the GPMF device name.
+    pub model: Option<String>,
+    /// When the recording started, as a Unix timestamp.
+    pub created: Option<i64>,
+}
+
+/// Read what the output's metadata needs, without needing exiftool to read it.
+pub fn source_info(path: &Path) -> SourceInfo {
+    let Ok(mut file) = crate::mp4::Mp4::open(path) else {
+        return SourceInfo::default();
+    };
+    let created = file.creation_time;
+    // The camera names itself in the GPMF device record: "MAX2" on this camera.
+    let model = crate::gpmf::from_mp4(&mut file).ok().and_then(|g| {
+        g.payloads
+            .first()
+            .and_then(|p| p.devices.first())
+            .and_then(|d| d.name.clone())
+    });
+    SourceInfo { model, created }
+}
+
+/// Declare the output spherical, so that players treat it as a sphere.
+///
+/// Without this an equirectangular file is just a very wide, very distorted
+/// rectangle: YouTube, VLC and every headset decide whether to offer 360
+/// navigation by looking for Google's `GSpherical` XMP block, and ffmpeg does
+/// not write it. So this is the difference between a 360 video and a picture of
+/// one.
+///
+/// Everything goes in a single exiftool invocation because each pass rewrites
+/// the whole file.
+///
+/// exiftool is optional: a missing one costs the metadata, not the render, and
+/// says so.
+pub fn tag_spherical(
+    output: &Path,
+    info: &SourceInfo,
+) -> anyhow::Result<bool> {
+    let Some(exiftool) = which("exiftool") else {
+        return Ok(false);
+    };
+
+    let mut args: Vec<String> = vec![
+        "-q".into(),
+        "-overwrite_original".into(),
+        "-XMP-GSpherical:Spherical=true".into(),
+        "-XMP-GSpherical:Stitched=true".into(),
+        "-XMP-GSpherical:ProjectionType=equirectangular".into(),
+        format!(
+            "-XMP-GSpherical:StitchingSoftware=gmax {}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "-QuickTime:Make=GoPro".into(),
+    ];
+    if let Some(model) = &info.model {
+        args.push(format!("-QuickTime:Model={model}"));
+    }
+    if let Some(created) = info.created {
+        // exiftool wants "YYYY:MM:DD HH:MM:SS".
+        if let Some(t) = chrono::DateTime::from_timestamp(created, 0) {
+            let stamp = t.format("%Y:%m:%d %H:%M:%S").to_string();
+            args.push(format!("-QuickTime:CreateDate={stamp}"));
+            args.push(format!("-XMP-exif:DateTimeOriginal={stamp}"));
+            args.push(format!("-XMP-photoshop:DateCreated={stamp}"));
+        }
+    }
+    args.push(output.display().to_string());
+
+    let out = std::process::Command::new(exiftool)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "exiftool could not tag {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(true)
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
+}

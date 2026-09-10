@@ -293,3 +293,33 @@ fn levels_the_reference_clip_from_its_own_gravity() {
     let r = render::level_from_gravity(mean).unwrap();
     assert!((r.pitch - 117.87).abs() < 0.1, "pitch was {:.4}", r.pitch);
 }
+
+#[test]
+fn source_info_comes_from_the_file_itself() {
+    let path = fixture_or_skip!(common::REFERENCE_360);
+    let info = render::source_info(&path);
+    // The camera names itself in the GPMF device record, so exiftool is not
+    // needed to read it -- only to write the output's metadata.
+    assert_eq!(info.model.as_deref(), Some("MAX2"));
+    // The container's own creation time, 2026-09-08T11:06:53Z on this clip.
+    let created = info.created.expect("a creation time");
+    let t = chrono::DateTime::from_timestamp(created, 0).unwrap();
+    assert_eq!(t.format("%Y-%m-%d").to_string(), "2026-09-08");
+}
+
+#[test]
+fn a_missing_exiftool_is_reported_rather_than_fatal() {
+    // Tagging a path that does not exist must not panic; and where exiftool is
+    // absent the call reports that fact instead of failing the render.
+    let result = render::tag_spherical(
+        std::path::Path::new("/nonexistent/nope.mp4"),
+        &render::SourceInfo::default(),
+    );
+    match result {
+        // exiftool present: it should refuse the missing file.
+        Ok(true) => panic!("tagging a nonexistent file reported success"),
+        // exiftool absent: not an error, just nothing done.
+        Ok(false) => {}
+        Err(_) => {}
+    }
+}

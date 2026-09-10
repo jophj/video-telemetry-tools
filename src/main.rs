@@ -474,6 +474,28 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
         );
     }
     ff.run_streaming(&cmd)?;
+
+    // An equirectangular file is only a 360 video if it says so: players decide
+    // whether to offer spherical navigation from Google's GSpherical XMP block,
+    // which ffmpeg does not write.
+    if !opts.preview {
+        let info = render::source_info(&args.input);
+        match render::tag_spherical(&output, &info) {
+            Ok(true) => {
+                if !quiet {
+                    println!("tagged as equirectangular 360 (spherical metadata)");
+                }
+            }
+            Ok(false) => eprintln!(
+                "gmax: warning: exiftool not found, so {} carries no spherical metadata and \
+                 players will show it as a flat image. Install exiftool and re-run, or tag it \
+                 yourself.",
+                output.display()
+            ),
+            Err(e) => eprintln!("gmax: warning: {e}"),
+        }
+    }
+
     if !quiet {
         println!("wrote {}", output.display());
     }

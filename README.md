@@ -17,7 +17,8 @@ gmax viewer    <video> [--telemetry F] [--port 8360]
 gmax encoders  [--accel gpu|cpu]
 ```
 
-`convert`, `clips` and `viewer` need ffmpeg on `PATH`. The rest read the
+`convert`, `clips` and `viewer` need ffmpeg on `PATH`. `convert` also uses
+exiftool, if it is there, to declare the output spherical. The rest read the
 container directly and need nothing installed.
 
 ## Quick start
@@ -66,6 +67,12 @@ what the centre of the frame looks at; the two are independent.
 The GPMF telemetry track is copied into the output by default, so `gmax
 telemetry` and `gmax analyse` work on a stitched file exactly as on the
 original.
+
+The output is then declared spherical, which is what makes it a 360 video
+rather than a very wide, very distorted rectangle: YouTube, VLC and every
+headset decide whether to offer spherical navigation by looking for Google's
+`GSpherical` XMP block, and ffmpeg does not write it. That step needs exiftool;
+without it the render still succeeds and says what is missing.
 
 ### `telemetry` — rider channels as CSV or JSON
 
