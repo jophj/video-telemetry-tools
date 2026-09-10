@@ -33,6 +33,90 @@ pub enum Command {
 
     /// Merge an external GPX into a GoPro track to repair poor GPS.
     Merge(MergeArgs),
+
+    /// Rank the interesting moments of a ride.
+    Analyse(AnalyseArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AnalyseArgs {
+    /// A GoPro .360/.mp4, a telemetry CSV, or a GPX track.
+    pub input: PathBuf,
+
+    /// Write the analysis as JSON instead of tables.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Write ffmpeg chapter markers to this path.
+    ///
+    /// Embed them with:
+    ///   gmax convert in.360 --chapters FILE
+    #[arg(long, value_name = "FILE")]
+    pub chapters: Option<PathBuf>,
+
+    /// Write a CMX3600 edit decision list to this path.
+    #[arg(long, value_name = "FILE")]
+    pub edl: Option<PathBuf>,
+
+    /// Write a cue-sheet CSV to this path, for tools that will not read an EDL.
+    #[arg(long, value_name = "FILE")]
+    pub cues: Option<PathBuf>,
+
+    /// Moments to report per metric.
+    #[arg(long, default_value_t = 10, value_name = "N")]
+    pub top: usize,
+
+    /// Minimum separation between reported moments, in seconds.
+    ///
+    /// Without this a top-ten list is not ten moments: one hard stop spanning
+    /// three samples would take three of the slots.
+    #[arg(long, default_value_t = 5.0, value_name = "S")]
+    pub min_gap: f64,
+
+    /// Lean angle beyond which an excursion counts as a curve.
+    #[arg(long, default_value_t = 15.0, value_name = "DEG")]
+    pub curve_threshold: f64,
+
+    /// Length of the curve-density window, in seconds.
+    #[arg(long, default_value_t = 10.0, value_name = "S")]
+    pub window: f64,
+
+    /// Multiple of the median sample interval above which a gap breaks a
+    /// derived channel rather than producing a false spike.
+    #[arg(long, default_value_t = 5.0, value_name = "N")]
+    pub max_gap: f64,
+
+    /// Where longitudinal acceleration comes from.
+    #[arg(long, value_enum, default_value_t = AccelSourceArg::Gps)]
+    pub accel_source: AccelSourceArg,
+
+    /// Restrict to these metrics, comma separated. Also sets report order.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub metric: Option<Vec<String>>,
+
+    /// Seconds of run-in before each moment, for chapters and the EDL.
+    #[arg(long, default_value_t = 6.0, value_name = "S")]
+    pub pre: f64,
+
+    /// Seconds after each moment.
+    #[arg(long, default_value_t = 4.0, value_name = "S")]
+    pub post: f64,
+
+    /// Merge windows that come within this of each other. Negative disables.
+    #[arg(long, default_value_t = 2.0, value_name = "S")]
+    pub merge_gap: f64,
+
+    /// Reject GPS fixes at or above this dilution of precision.
+    #[arg(long, default_value_t = 5.0, value_name = "DOP")]
+    pub max_dop: f64,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelSourceArg {
+    /// Differentiate GPS speed. Comparable across every source.
+    Gps,
+    /// Use the IMU's vehicle-frame longitudinal channel, where there is one.
+    Imu,
 }
 
 #[derive(Args, Debug)]

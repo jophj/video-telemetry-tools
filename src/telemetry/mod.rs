@@ -289,17 +289,39 @@ impl Telemetry {
         gain
     }
 
-    /// Runs of consecutive valid fixes with no gap longer than a second.
+    /// Longest gap between fixes that still counts as continuous coverage.
+    ///
+    /// Five times the receiver's measured interval, which is the same rule the
+    /// moments engine uses for breaking a derived channel. Expressing it once
+    /// keeps the two from reporting different distances for the same ride.
+    pub fn coverage_gap_threshold(&self) -> f64 {
+        const GAP_FACTOR: f64 = 5.0;
+        let mut deltas: Vec<f64> = self
+            .gps
+            .windows(2)
+            .map(|w| w[1].time - w[0].time)
+            .filter(|d| *d > 0.0)
+            .collect();
+        if deltas.is_empty() {
+            return 1.0;
+        }
+        deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        quantile_sorted(&deltas, 0.5) * GAP_FACTOR
+    }
+
+    /// Runs of consecutive valid fixes with no gap longer than
+    /// [`Telemetry::coverage_gap_threshold`].
     ///
     /// Anything derived by integrating along the track — distance, climb —
     /// has to respect these boundaries, because between them the bike went
     /// somewhere that was not recorded.
     pub fn coverage_runs(&self) -> Vec<Vec<&GpsFix>> {
+        let threshold = self.coverage_gap_threshold();
         let mut runs: Vec<Vec<&GpsFix>> = Vec::new();
         let mut current: Vec<&GpsFix> = Vec::new();
         for f in self.gps.iter().filter(|f| f.valid) {
             match current.last() {
-                Some(prev) if f.time - prev.time <= 1.0 => current.push(f),
+                Some(prev) if f.time - prev.time <= threshold => current.push(f),
                 Some(_) => {
                     runs.push(std::mem::take(&mut current));
                     current.push(f);
