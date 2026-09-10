@@ -27,8 +27,13 @@ PREVIEW=0               # write a single JPEG instead of a video
 PRINT_ROT=0             # print the computed yaw:pitch:roll and exit
 JOIN=0                  # concatenate GS02…/GS03… chapters of the same clip
 OUTPUT=
-VT_Q=65                 # hevc_videotoolbox quality (0-100); ~50 Mb/s at 3840x1920
-X265_CRF=16
+ENCODER=                # explicit encoder; empty means derive from --quality
+ACCEL=auto              # auto | gpu | cpu -- restricts the encoder choices
+PICK=0                  # 1: pick the encoder from an interactive menu
+LIST_ENC=0              # 1: print the encoder table and exit
+ENC_Q=                  # rate-control value; empty means the encoder's default
+HW_FILTER=              # filter appended to upload frames to the GPU (VAAPI)
+HW_DEV=                 # VAAPI render node
 JOBS=
 
 self=$(basename "$0")
@@ -59,12 +64,27 @@ Orientation
                         chapter of one recording can share it via --rotate
 
 Encoding
-  -q, --quality PRESET  high    hevc_videotoolbox 10-bit, hardware  (default)
-                        max     libx265 CRF $X265_CRF 10-bit, preset slow (slow)
+      --list-encoders   list the video encoders this machine can really use
+                        and exit.  Hardware encoders are verified with a
+                        one-frame test encode, because ffmpeg advertises them
+                        even with no matching GPU in the box.
+  -E, --encoder NAME    encode with NAME (e.g. libx265, hevc_nvenc).  Any
+                        ffmpeg encoder is accepted; the ones listed by
+                        --list-encoders come with tuned settings.
+      --pick-encoder    choose interactively from the usable encoders
+      --accel MODE      auto (default) | gpu | cpu -- restrict --quality and
+                        --pick-encoder to hardware or software encoders
+  -q, --quality PRESET  high    best available HEVC, hardware first (default)
+                        max     libx265 10-bit, preset slow (slow, smallest)
+                        av1     best available AV1
                         prores  ProRes 422 HQ, for NLE round-tripping
-                        h264    libx264 CRF 18, maximum compatibility
-      --vt-quality N    hevc_videotoolbox quality 0-100 (default $VT_Q)
-      --crf N           libx265/libx264 CRF (default $X265_CRF / 18)
+                        h264    H.264, maximum compatibility
+                        A preset is a candidate list: the first encoder that
+                        works on this machine wins, so run --list-encoders to
+                        see what each one resolves to.
+      --enc-quality N   rate-control value, on the chosen encoder's own scale
+                        (CRF, CQ or QP; 0-100 for VideoToolbox).  --crf and
+                        --vt-quality are aliases kept for compatibility.
   -j, --jobs N          ffmpeg filter threads (default: auto)
 
 Audio / metadata
@@ -90,8 +110,209 @@ Examples
   $self GS010526.360
   $self --preview GS010526.360
   $self -q max -a both --join GS010527.360 ride.mov
+  $self --list-encoders
+  $self --pick-encoder GS010526.360
+  $self -E hevc_nvenc --enc-quality 20 GS010526.360
 EOF
   exit 1
+}
+
+# --------------------------------------------------------------- encoders ----
+# Which encoders a build *exposes* says nothing about which ones the machine
+# can *run*: the same ffmpeg binary advertises hevc_nvenc with no NVIDIA card
+# in the box and h264_qsv with no Intel GPU, and both only fail once the real
+# encode starts -- an hour into a 360 stitch.  So every hardware encoder is
+# verified up front with a one-frame test encode.  Software encoders are
+# trusted from the build list alone; if they are compiled in, they work.
+#
+#   name | kind | codec | pix_fmt | default rate-control value | notes
+ENC_TABLE='
+hevc_videotoolbox|gpu|hevc|p010le|65|Apple VideoToolbox, 10-bit (quality 0-100)
+h264_videotoolbox|gpu|h264|nv12|60|Apple VideoToolbox, 8-bit (quality 0-100)
+prores_videotoolbox|gpu|prores|p210le|-|Apple VideoToolbox ProRes 422 HQ
+hevc_nvenc|gpu|hevc|p010le|22|NVIDIA NVENC, 10-bit (CQ)
+h264_nvenc|gpu|h264|yuv420p|22|NVIDIA NVENC, 8-bit (CQ)
+av1_nvenc|gpu|av1|p010le|28|NVIDIA NVENC AV1, 10-bit, Ada or newer (CQ)
+hevc_qsv|gpu|hevc|p010le|23|Intel QuickSync, 10-bit (global_quality)
+h264_qsv|gpu|h264|nv12|23|Intel QuickSync, 8-bit (global_quality)
+av1_qsv|gpu|av1|p010le|30|Intel QuickSync AV1, 10-bit, Arc or newer
+hevc_amf|gpu|hevc|p010le|22|AMD AMF, 10-bit (QP)
+h264_amf|gpu|h264|nv12|22|AMD AMF, 8-bit (QP)
+av1_amf|gpu|av1|p010le|28|AMD AMF AV1, 10-bit (QP)
+hevc_vaapi|gpu|hevc|p010|22|VAAPI, 10-bit (QP)
+h264_vaapi|gpu|h264|nv12|22|VAAPI, 8-bit (QP)
+av1_vaapi|gpu|av1|p010|28|VAAPI AV1, 10-bit (QP)
+libx265|cpu|hevc|yuv420p10le|16|x265 10-bit, preset slow (CRF)
+libx264|cpu|h264|yuv420p|18|x264 8-bit, preset slow (CRF)
+libsvtav1|cpu|av1|yuv420p10le|28|SVT-AV1 10-bit, preset 6 (CRF)
+libaom-av1|cpu|av1|yuv420p10le|30|libaom AV1 10-bit, very slow (CRF)
+libvpx-vp9|cpu|vp9|yuv420p10le|31|VP9 10-bit, slow (CRF)
+prores_ks|cpu|prores|yuv422p10le|-|ProRes 422 HQ, for NLE round-tripping
+'
+
+LISTED_ENC=            # encoders compiled into this ffmpeg
+AVAIL_ENC=             # of those, the ones that really encode a frame here
+ENC_PROBED=0
+VAAPI_DEV=
+
+upper()      { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+enc_field()  { printf '%s\n' "$ENC_TABLE" | awk -F'|' -v k="$1" -v n="$2" '$1==k{print $n; exit}'; }
+enc_known()  { [ -n "$(enc_field "$1" 1)" ]; }
+enc_listed() { printf '%s\n' "$LISTED_ENC" | grep -qxF -- "$1"; }
+enc_avail()  { case " $AVAIL_ENC " in *" $1 "*) return 0;; esac; return 1; }
+
+accel_ok() {                   # $1=encoder -- does it match --accel?
+  case $ACCEL in
+    auto) return 0;;
+    *)    [ "$(enc_field "$1" 2)" = "$ACCEL" ];;
+  esac
+}
+
+# One frame of black through the real encoder.  -nostdin matters: this runs
+# inside a `while read` loop and ffmpeg would otherwise eat the table.
+enc_test() {
+  local e=$1
+  case $e in
+    *_vaapi)
+      [ -n "$VAAPI_DEV" ] || return 1
+      ffmpeg -hide_banner -loglevel error -nostdin -vaapi_device "$VAAPI_DEV" \
+        -f lavfi -i "color=c=black:s=320x240:r=1:d=1" \
+        -vf "format=$(enc_field "$e" 4),hwupload" \
+        -frames:v 1 -c:v "$e" -f null - >/dev/null 2>&1 </dev/null;;
+    *)
+      ffmpeg -hide_banner -loglevel error -nostdin \
+        -f lavfi -i "color=c=black:s=320x240:r=1:d=1" \
+        -frames:v 1 -c:v "$e" -f null - >/dev/null 2>&1 </dev/null;;
+  esac
+}
+
+detect_encoders() {
+  [ "$ENC_PROBED" = 0 ] || return 0
+  ENC_PROBED=1
+  LISTED_ENC=$(ffmpeg -hide_banner -encoders 2>/dev/null | awk '$1 ~ /^V/ {print $2}')
+  local d name kind rest
+  for d in /dev/dri/renderD*; do [ -e "$d" ] && { VAAPI_DEV=$d; break; }; done
+  while IFS='|' read -r name kind rest; do
+    [ -n "$name" ] || continue
+    enc_listed "$name" || continue
+    [ "$kind" != gpu ] || enc_test "$name" || continue
+    AVAIL_ENC="$AVAIL_ENC $name"
+  done <<EOF
+$ENC_TABLE
+EOF
+}
+
+enc_first_avail() {            # $@=candidates in preference order
+  local e
+  for e in "$@"; do
+    accel_ok "$e" && enc_avail "$e" && { printf '%s' "$e"; return 0; }
+  done
+  return 1
+}
+
+# Each --quality preset is a candidate list rather than one encoder, so the
+# same command line works on an Apple laptop, an NVIDIA box and a bare VM.
+enc_candidates() {
+  case $1 in
+    high)   echo hevc_videotoolbox hevc_nvenc hevc_qsv hevc_amf hevc_vaapi libx265;;
+    max)    echo libx265 hevc_videotoolbox hevc_nvenc hevc_qsv hevc_amf hevc_vaapi;;
+    av1)    echo libsvtav1 av1_nvenc av1_qsv av1_amf av1_vaapi libaom-av1;;
+    prores) echo prores_ks prores_videotoolbox;;
+    h264)   echo libx264 h264_videotoolbox h264_nvenc h264_qsv h264_amf h264_vaapi;;
+  esac
+}
+
+enc_status() {
+  if   enc_avail  "$1"; then echo usable
+  elif enc_listed "$1"; then echo "no device"
+  else                       echo "not built"; fi
+}
+
+list_encoders() {
+  note "probing encoders (each hardware one gets a one-frame test encode)..."
+  detect_encoders
+  local name kind fam pix defq desc p e
+  printf '\n  %-9s %-21s %-4s %-6s %s\n' status encoder type codec notes >&2
+  while IFS='|' read -r name kind fam pix defq desc; do
+    [ -n "$name" ] || continue
+    printf '  %-9s %-21s %-4s %-6s %s\n' \
+      "$(enc_status "$name")" "$name" "$(upper "$kind")" "$(upper "$fam")" "$desc" >&2
+  done <<EOF
+$ENC_TABLE
+EOF
+  printf '\n  presets on this machine%s:\n' \
+    "$([ "$ACCEL" = auto ] || printf ' with --accel %s' "$ACCEL")" >&2
+  for p in high max av1 prores h264; do
+    e=$(enc_first_avail $(enc_candidates "$p")) || e='(nothing usable)'
+    printf '    --quality %-7s %s\n' "$p" "$e" >&2
+  done
+  printf '\n  "no device" means ffmpeg has the encoder but this machine cannot run it.\n' >&2
+  printf '  Choose one with  -E NAME,  or  --pick-encoder  for a menu.\n' >&2
+}
+
+pick_encoder() {
+  [ -e /dev/tty ] || die "--pick-encoder needs a terminal; use -E NAME instead"
+  note "probing encoders (each hardware one gets a one-frame test encode)..."
+  detect_encoders
+  local names=() name kind fam pix defq desc def defidx=1 i sel mark
+  def=$(enc_first_avail $(enc_candidates "$QUALITY")) || def=
+  printf '\n  %-3s %-21s %-4s %-6s %s\n' '#' encoder type codec notes >&2
+  while IFS='|' read -r name kind fam pix defq desc; do
+    [ -n "$name" ] || continue
+    enc_avail "$name" || continue
+    accel_ok  "$name" || continue
+    names[${#names[@]}]=$name
+    i=${#names[@]}
+    mark=
+    if [ "$name" = "$def" ]; then defidx=$i; mark='  [default]'; fi
+    printf '  %-3s %-21s %-4s %-6s %s%s\n' \
+      "$i" "$name" "$(upper "$kind")" "$(upper "$fam")" "$desc" "$mark" >&2
+  done <<EOF
+$ENC_TABLE
+EOF
+  [ ${#names[@]} -gt 0 ] || die "no usable encoder found for --accel $ACCEL"
+  printf '\n  encoder [%s]: ' "$defidx" >&2
+  read -r sel </dev/tty || sel=
+  [ -n "$sel" ] || sel=$defidx
+  case $sel in *[!0-9]*) die "not a number: $sel";; esac
+  [ "$sel" -ge 1 ] && [ "$sel" -le ${#names[@]} ] || die "out of range: $sel"
+  ENCODER=${names[$((sel-1))]}
+}
+
+resolve_encoder() {
+  detect_encoders
+  if [ "$PICK" = 1 ]; then
+    pick_encoder
+  elif [ -n "$ENCODER" ]; then
+    if enc_known "$ENCODER"; then
+      enc_avail "$ENCODER" || \
+        die "$ENCODER is \"$(enc_status "$ENCODER")\" here; see --list-encoders"
+      accel_ok "$ENCODER" || note "$ENCODER is not a $ACCEL encoder; using it anyway"
+    else
+      enc_listed "$ENCODER" || die "this ffmpeg has no encoder named $ENCODER"
+      note "$ENCODER has no tuned settings here; encoding with ffmpeg defaults"
+    fi
+  else
+    ENCODER=$(enc_first_avail $(enc_candidates "$QUALITY")) || \
+      die "no usable encoder for --quality $QUALITY --accel $ACCEL; see --list-encoders"
+  fi
+
+  # A "-" default marks an encoder with no rate-control knob at all (ProRes),
+  # where a quality number would be a lie rather than a setting.
+  if [ "$(enc_field "$ENCODER" 5)" = - ]; then
+    [ -z "$ENC_Q" ] || note "$ENCODER has no quality setting; ignoring $ENC_Q"
+    ENC_Q=
+  else
+    [ -n "$ENC_Q" ] || ENC_Q=$(enc_field "$ENCODER" 5)
+  fi
+
+  case $ENCODER in
+    *_vaapi)
+      [ -n "$VAAPI_DEV" ] || die "no VAAPI render node under /dev/dri"
+      HW_DEV=$VAAPI_DEV
+      HW_FILTER=",format=$(enc_field "$ENCODER" 4),hwupload";;
+  esac
+  note "encoding with $ENCODER${ENC_Q:+ (quality $ENC_Q)}"
 }
 
 # ------------------------------------------------------------------ parsing --
@@ -105,8 +326,11 @@ while [ $# -gt 0 ]; do
     --rotate)        IFS=: read -r YAW PITCH ROLL <<<"${2:-}"; LEVEL=0; shift 2;;
     --yaw)           YAW=${2:-0}; shift 2;;
     -q|--quality)    QUALITY=${2:-}; shift 2;;
-    --vt-quality)    VT_Q=${2:-}; shift 2;;
-    --crf)           X265_CRF=${2:-}; shift 2;;
+    -E|--encoder)    ENCODER=${2:-}; shift 2;;
+    --pick-encoder)  PICK=1; shift;;
+    --list-encoders) LIST_ENC=1; shift;;
+    --accel)         ACCEL=${2:-}; shift 2;;
+    --enc-quality|--crf|--vt-quality) ENC_Q=${2:-}; shift 2;;
     -j|--jobs)       JOBS=${2:-}; shift 2;;
     -a|--audio)      AUDIO=${2:-}; shift 2;;
     --no-telemetry)  TELEMETRY=0; shift;;
@@ -120,15 +344,25 @@ while [ $# -gt 0 ]; do
     *)               if [ -z "${INPUT:-}" ]; then INPUT=$1; else OUTPUT=$1; fi; shift;;
   esac
 done
+
+command -v ffmpeg >/dev/null || die "ffmpeg not found (brew install ffmpeg)"
+case $ACCEL in auto|gpu|cpu) ;; *) die "bad --accel: $ACCEL (auto|gpu|cpu)";; esac
+
+if [ "$LIST_ENC" = 1 ]; then list_encoders; exit 0; fi
+
 [ -n "${INPUT:-}" ] || usage
 [ -f "$INPUT" ]     || die "no such file: $INPUT"
 
-command -v ffmpeg  >/dev/null || die "ffmpeg not found (brew install ffmpeg)"
 command -v ffprobe >/dev/null || die "ffprobe not found"
 command -v python3 >/dev/null || { [ "$LEVEL" = 1 ] && die "python3 needed for --level"; }
 
 case $AUDIO in stereo|ambisonic|both|none) ;; *) die "bad --audio: $AUDIO";; esac
-case $QUALITY in high|max|prores|h264) ;; *) die "bad --quality: $QUALITY";; esac
+case $QUALITY in high|max|av1|prores|h264) ;; *) die "bad --quality: $QUALITY";; esac
+
+# Settle the encoder before any of the slow work: a typo in -E should fail now,
+# not after minutes of gravity parsing.  --preview writes a JPEG, --print-rotation
+# writes nothing, so neither needs an encoder (nor the probe that finds one).
+if [ "$PREVIEW" = 0 ] && [ "$PRINT_ROT" = 0 ]; then resolve_encoder; fi
 
 # ---------------------------------------------------------------- probing ----
 # The two EAC tracks are the only video streams; their index differs between
@@ -298,23 +532,43 @@ build_graph() {
   printf '[FL][FF][FR]hstack=3[row0];'
   printf '[FD][FB][FU]hstack=3[row1];'
   printf '[row0][row1]vstack=2[eac];'      # ffmpeg's 3x2 EAC face order
-  printf '[eac]v360=input=eac:output=e:w=%d:h=%d:interp=%s:yaw=%s:pitch=%s:roll=%s[vout]' \
-         "$OUT_W" "$OUT_H" "$INTERP" "$YAW" "$PITCH" "$ROLL"
+  # HW_FILTER is empty unless the encoder wants its frames on the GPU (VAAPI)
+  printf '[eac]v360=input=eac:output=e:w=%d:h=%d:interp=%s:yaw=%s:pitch=%s:roll=%s%s[vout]' \
+         "$OUT_W" "$OUT_H" "$INTERP" "$YAW" "$PITCH" "$ROLL" "$HW_FILTER"
 }
 
 # --------------------------------------------------------------- encoding ----
+# Rate control is the one thing every encoder family spells differently:
+# VideoToolbox takes a 0-100 quality, x264/x265/AV1 a CRF, NVENC a CQ, QSV a
+# global_quality, AMF and VAAPI a QP.  ENC_Q holds the number; this maps it.
 video_opts() {
-  case $QUALITY in
-    high)   printf -- '-c:v hevc_videotoolbox -q:v %s -pix_fmt p010le -profile:v main10 -tag:v hvc1' "$VT_Q";;
-    max)    printf -- '-c:v libx265 -crf %s -preset slow -pix_fmt yuv420p10le -tag:v hvc1 -x265-params log-level=error' "$X265_CRF";;
-    prores) printf -- '-c:v prores_ks -profile:v 3 -vendor apl0 -pix_fmt yuv422p10le';;
-    h264)   printf -- '-c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p';;
+  local e=$ENCODER q=$ENC_Q pix
+  pix=$(enc_field "$e" 4)
+  case $e in
+    prores_videotoolbox) printf -- '-c:v prores_videotoolbox -profile:v hq';;
+    prores_ks)  printf -- '-c:v prores_ks -profile:v 3 -vendor apl0';;
+    *_videotoolbox) printf -- '-c:v %s -q:v %s' "$e" "$q";;
+    *_nvenc)    printf -- '-c:v %s -preset p5 -tune hq -rc vbr -cq %s -b:v 0' "$e" "$q";;
+    *_qsv)      printf -- '-c:v %s -preset medium -global_quality %s' "$e" "$q";;
+    *_amf)      printf -- '-c:v %s -quality quality -rc cqp -qp_i %s -qp_p %s' "$e" "$q" "$q";;
+    *_vaapi)    printf -- '-c:v %s -rc_mode CQP -qp %s' "$e" "$q";;
+    libx265)    printf -- '-c:v libx265 -crf %s -preset slow -x265-params log-level=error' "$q";;
+    libx264)    printf -- '-c:v libx264 -crf %s -preset slow' "$q";;
+    libsvtav1)  printf -- '-c:v libsvtav1 -crf %s -preset 6' "$q";;
+    libaom-av1) printf -- '-c:v libaom-av1 -crf %s -b:v 0 -cpu-used 4 -row-mt 1' "$q";;
+    libvpx-vp9) printf -- '-c:v libvpx-vp9 -crf %s -b:v 0 -row-mt 1' "$q";;
+    *)          printf -- '-c:v %s%s' "$e" "${q:+ -crf $q}";;
   esac
+  # With VAAPI the frames reach the encoder on the GPU, already formatted.
+  case $e in *_vaapi) ;; *) [ -z "$pix" ] || printf -- ' -pix_fmt %s' "$pix";; esac
+  case $e in hevc_videotoolbox) printf -- ' -profile:v main10';; esac
+  # QuickTime, Photos and most NLEs ignore HEVC tagged hev1
+  case $(enc_field "$e" 3) in hevc) printf -- ' -tag:v hvc1';; esac
 }
 
 # Container: ProRes and 4-channel ambisonic PCM are only valid in .mov
 container_ext() {
-  case $QUALITY in prores) echo mov; return;; esac
+  case $(enc_field "$ENCODER" 3) in prores) echo mov; return;; esac
   case $AUDIO in ambisonic|both) echo mov; return;; esac
   echo mp4
 }
@@ -349,6 +603,7 @@ convert_one() {               # $1=input  $2=output
 
   ffmpeg -hide_banner -noautorotate \
     ${JOBS:+-filter_threads "$JOBS"} \
+    ${HW_DEV:+-vaapi_device "$HW_DEV"} \
     ${START:+-ss "$START"} ${DURATION:+-t "$DURATION"} \
     -i "$in" \
     -filter_complex "$graph" \
@@ -399,7 +654,7 @@ base=${INPUT%.*}
 if [ "$ext" = mov ] && [ -n "$OUTPUT" ] && [ "$PREVIEW" = 0 ]; then
   case $OUTPUT in
     *.mp4|*.MP4)
-      note "$QUALITY/$AUDIO requires a .mov container; writing ${OUTPUT%.*}.mov"
+      note "$ENCODER/$AUDIO requires a .mov container; writing ${OUTPUT%.*}.mov"
       OUTPUT="${OUTPUT%.*}.mov";;
   esac
 fi

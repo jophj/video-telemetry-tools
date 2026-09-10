@@ -114,16 +114,74 @@ The source is 8-bit 4:2:0 HEVC, full range (`yuvj420p`, bt709). The pipeline:
 - encodes 10-bit to keep the transform's intermediate precision out of the
   8-bit quantisation grid.
 
-| `--quality` | encoder | ~bitrate at 3840×1920 | speed |
-|---|---|---|---|
-| `high` (default) | `hevc_videotoolbox` q=65, 10-bit | ~50 Mb/s | ~1.6× realtime |
-| `max` | `libx265` CRF 16, preset slow, 10-bit | ~35 Mb/s | ~5× slower than realtime |
-| `prores` | ProRes 422 HQ | ~800 Mb/s | fast, very large |
-| `h264` | `libx264` CRF 18 | — | for maximum compatibility |
+### Choosing an encoder
+
+`--quality` is a *candidate list*, not a fixed encoder. The script probes the
+local ffmpeg and picks the first candidate that works here, so the same command
+line does the right thing on an Apple laptop, an NVIDIA box or a bare VM.
+
+| `--quality` | candidates, in order | on this Mac | ~bitrate at 3840×1920 | speed |
+|---|---|---|---|---|
+| `high` (default) | HEVC, hardware first: `hevc_videotoolbox`, `hevc_nvenc`, `hevc_qsv`, `hevc_amf`, `hevc_vaapi`, `libx265` | `hevc_videotoolbox` q=65, 10-bit | ~50 Mb/s | ~1.6× realtime |
+| `max` | `libx265` first, then the hardware HEVC encoders | `libx265` CRF 16, preset slow, 10-bit | ~35 Mb/s | ~5× slower than realtime |
+| `av1` | `libsvtav1`, `av1_nvenc`, `av1_qsv`, `av1_amf`, `av1_vaapi`, `libaom-av1` | `libsvtav1` CRF 28, preset 6, 10-bit | ~half of `high` | ~5× slower than realtime |
+| `prores` | `prores_ks`, `prores_videotoolbox` | ProRes 422 HQ | ~800 Mb/s | fast, very large |
+| `h264` | `libx264`, then the hardware H.264 encoders | `libx264` CRF 18 | — | for maximum compatibility |
 
 `high` is the default because `max` would take hours on the 8.5 GB clips in
 `100GOPRO/`; it is the better choice if you have the time and want the smallest
 transparent file.
+
+The `av1` column is relative because AV1's CRF scale is not x265's. Measured on
+one busy 4-second segment of `GS010527.360` at 3840×1920 on an Apple GPU:
+`high` 94 Mb/s at 0.58× realtime, `max` 95 Mb/s at 0.047× realtime, `av1`
+48 Mb/s at 0.21× realtime — so on this footage AV1 buys roughly half the size
+of `high` for ~3× the encode time, and gets there ~4× faster than `max` does.
+Player support is the catch: AV1 in a 360 player is far less of a sure thing
+than HEVC.
+
+To see what is actually available, and what each preset resolves to:
+
+```sh
+./gopromax2-stitch.sh --list-encoders
+```
+
+```
+  status    encoder               type codec  notes
+  usable    hevc_videotoolbox     GPU  HEVC   Apple VideoToolbox, 10-bit (quality 0-100)
+  not built hevc_nvenc            GPU  HEVC   NVIDIA NVENC, 10-bit (CQ)
+  usable    libx265               CPU  HEVC   x265 10-bit, preset slow (CRF)
+  ...
+  presets on this machine:
+    --quality high    hevc_videotoolbox
+    --quality max     libx265
+```
+
+A build advertising an encoder does not mean the machine can run it — the same
+ffmpeg binary lists `hevc_nvenc` with no NVIDIA card in the box, and it only
+fails once the encode starts, potentially an hour into a stitch. So every
+hardware encoder is verified with a real one-frame test encode before it is
+offered, and one that is present but unusable shows as `no device`. Software
+encoders are trusted from the build list alone.
+
+Three ways to override the preset:
+
+```sh
+./gopromax2-stitch.sh --pick-encoder GS010526.360   # menu of the usable ones
+./gopromax2-stitch.sh -E libsvtav1   GS010526.360   # by name
+./gopromax2-stitch.sh --accel gpu -q max GS010526.360   # gpu | cpu | auto
+```
+
+`--accel gpu` or `--accel cpu` filters the candidate lists and the menu, which
+is the quickest way to say "hardware, whatever this machine has" or "software,
+I want the compression". `-E` accepts any encoder ffmpeg has; the ones in the
+table above come with tuned settings, anything else gets ffmpeg's defaults.
+
+Rate control is the one thing every encoder family spells differently —
+VideoToolbox takes a 0–100 quality, x264/x265/AV1 a CRF, NVENC a CQ, QSV a
+`global_quality`, AMF and VAAPI a QP. `--enc-quality N` sets that number on
+whichever scale the chosen encoder uses, and each encoder carries a sensible
+default (shown by `--list-encoders`). `--crf` and `--vt-quality` are aliases.
 
 Audio and telemetry are passed through untouched: `--audio stereo` (default)
 copies the AAC track, `--audio ambisonic`/`both` copies the 4-channel ambisonic
@@ -702,3 +760,128 @@ two inverted signals. Aligned on lean and corrected for sign, the same two
 series agree at **|r| = 0.87**. The magnitude gap is real and remains — over
 these clips the phone reads 51–55° (clamping at exactly ±55.0°) where the camera
 reads 30–42° for the same corners.
+
+# Watching it back — `telemetry-viewer.py`
+
+`telemetry-viewer.py` serves the stitched video with the telemetry drawn over it
+as a live HUD, in the browser, with controls to slide the data against the
+picture until they agree.
+
+```sh
+./gopro-telemetry.py sources/GS010527.360                  # → .telemetry.csv
+./telemetry-viewer.py sources/GS010527_equirect.mp4        # → http://127.0.0.1:8360/
+```
+
+```
+GS010527.telemetry.csv  (46080 samples, 1537.5 s @ 29.97003 Hz)
+  timebase      30 Hz / 1.001000 s payload, measured from GS010527.360
+  vs nominal    30 Hz would drift -1.54 s over the clip
+  gps fix       54.9% of samples
+  video         GS010527_proxy.mp4  (911 MB, 600.0 s)
+  note          video covers only the first 600 s of 1538 s of telemetry
+  telemetry     4.3 MB of JSON
+  -> http://127.0.0.1:8360/   (ctrl-c to stop)
+```
+
+The video is rendered as a real 360 view — drag to look around, scroll to zoom
+— rather than as a flat panorama, so the HUD stays undistorted while the
+picture behind it is reprojected. A fragment shader turns each pixel into a
+view ray and samples the equirectangular frame directly; there is no sphere
+mesh, so no polar pinching and no visible seam. It needs no network and no
+JavaScript libraries.
+
+The HUD shows lean angle on a ±50° gauge with peak-hold, speed, a g-meter with
+a short trail, and the body rates. Below the picture is a ±24 s lean trace with
+the playhead on it, which is the thing that actually makes alignment possible:
+the shape of a corner in the trace is easy to match against the corner you can
+see. Stretches with no GPS fix are shaded, since speed reads `—` there rather
+than a stale number.
+
+## Aligning the data to the picture
+
+| control | what it does |
+|---|---|
+| `DATA OFFSET` | slides telemetry against video, ±10 s, frame-resolution |
+| `[` `]` | nudge by one frame; with `shift`, by one second |
+| `←` `→` | step the video by a frame; with `shift`, by a second |
+| `LEAN TRIM` | adds a constant to lean, for mount-calibration disagreement |
+| `LEAN SIGN` | show the CSV's raw (inverted) sign instead of the corrected one |
+| `DATA RATE` | scales the sample rate, for residual drift over a long clip |
+| `roll` | rotates the view about its axis, to level a tilted horizon |
+| drag / scroll / `Recentre` | look around, zoom, return to the default view |
+
+Offset, trim, sign and rate persist in the browser, so they survive a reload
+and a restart of the server; so does the view orientation.
+
+## Levelling, and why there is a roll control
+
+`GS010527_equirect.mp4` is **not levelled**. Its equirect centre sits roughly
+70° below the forward horizon and the horizon is rolled, so a centred view is
+pure tarmac — the forward road lives near the *top* edge of the frame. Checked
+by reprojecting the frame at t=300 s through `v360=e:flat` across a pitch
+sweep, at a moment the telemetry puts at 75 km/h, +12° of lean and ~0° pitch,
+so it is the stitch's orientation and not the bike's attitude:
+
+```sh
+ffmpeg -ss 300 -i GS010527_equirect.mp4 -frames:v 1   -vf "v360=e:flat:h_fov=100:v_fov=60:pitch=0"  centre.jpg   # tarmac
+ffmpeg -ss 300 -i GS010527_equirect.mp4 -frames:v 1   -vf "v360=e:flat:h_fov=100:v_fov=60:pitch=72" ahead.jpg    # the road ahead
+```
+
+So `gopromax2-stitch.sh --level` did not work on this clip, and the viewer
+opens at a default pitch of 72° to compensate. Pitch and roll interact badly
+that far from centre — near ±90° they go gimbal-degenerate and roll mostly
+spins the view — which is why the orientation is left to the `roll` slider and
+dragging rather than a fixed correction. It is far quicker to level by eye in
+the live view than to bisect it with `ffmpeg` renders.
+
+The clean fix is upstream: re-stitch with an explicit `--rotate Y:P:R`, or with
+`--no-level` and level in the viewer.
+
+`LEAN TRIM` exists because the upright reference is the mean gravity direction
+over straight-line riding, so it is computed per clip: the full `GS010527.360`
+and a 600 s cut of it disagree by a near-constant **2.2°**, the shorter cut
+having less straight-line riding to average. The longer the clip, the more
+trustworthy its zero.
+
+## The 1.001 timebase correction
+
+`gopro-telemetry.py` derives its sample rate as samples ÷ payloads = exactly
+30 Hz, and writes `time_s` on that grid. But a GPMF payload is one payload per
+*video* second, and on an NTSC-rate clip that is **1.001 s**, not 1 s — the
+`gpmd` track's packet durations say so outright:
+
+```
+$ ffprobe -select_streams 4 -show_entries packet=pts_time,duration_time GS010527.360
+0.000000,1.001000
+1.001000,1.001000
+2.002000,1.001000
+```
+
+So `time_s` runs 0.1% fast: **0.6 s adrift by t=600 s**, 1.54 s over a full
+26-minute chapter — enough to put the lean trace a corner behind. The viewer
+measures the payload duration from whichever file beside it still has a `gpmd`
+track and uses `nominal ÷ payload_duration` instead, giving 29.97003 Hz.
+
+The corrected rate is what the container agrees with: 46080 samples ÷ 29.97003 Hz
+= 1537.50 s against the file's own 1537.536 s, where the nominal 30 Hz claims
+1536.00 s and is 1.5 s short. `--rate` overrides it if a clip disagrees.
+
+This affects `gopro-telemetry.py`'s CSV and GPX output too — `time_s`,
+`video_time_s` and the absolute `utc` stamps all inherit it.
+
+## Playing an 8 GB HEVC in a browser
+
+The stitch writes 10-bit HEVC at ~118 Mb/s. Safari will decode it; Chrome
+generally will not, and either way scrubbing a 3840×1920 118 Mb/s stream is
+too slow to align against. Transcode a proxy once and point the viewer at that:
+
+```sh
+ffmpeg -i GS010527_equirect.mp4 -vf scale=2560:1280 \
+  -c:v h264_videotoolbox -b:v 12M -pix_fmt yuv420p \
+  -c:a aac -b:a 128k -movflags +faststart GS010527_proxy.mp4
+```
+
+That is ~3.5× realtime and 911 MB for 600 s, and the viewer finds the telemetry
+CSV through the `_proxy` suffix on its own. The built-in server speaks HTTP/1.1
+with `Range`, which is what lets the browser seek inside a file that large;
+Python's `http.server` alone does not, and seeking silently fails without it.

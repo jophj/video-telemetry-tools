@@ -1,0 +1,893 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ride telemetry viewer</title>
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#14181d; --line:#252c34; --ink:#e8edf2;
+    --dim:#8b97a5; --accent:#5ac8fa; --left:#ffd166; --right:#06d6a0; --warn:#ef476f;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       overflow:hidden}
+  #app{display:flex;flex-direction:column;height:100%}
+
+  /* ---------------------------------------------------------------- stage */
+  #stage{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
+  #gl{display:block;width:100%;height:100%;cursor:grab}
+  #gl.drag{cursor:grabbing}
+  video{display:none}
+
+  #hud{position:absolute;inset:0;pointer-events:none}
+  #msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+       text-align:center;padding:24px;color:var(--dim);font-family:var(--mono);
+       font-size:13px;white-space:pre-wrap;background:#000}
+  #msg.hide{display:none}
+
+  /* lean gauge, bottom-left */
+  #lean{position:absolute;left:22px;bottom:22px;width:250px;
+        background:rgba(10,13,16,.62);border:1px solid rgba(255,255,255,.09);
+        border-radius:12px;padding:12px 14px 10px;backdrop-filter:blur(8px)}
+  #lean svg{display:block;width:100%;height:auto}
+  .lean-read{display:flex;align-items:baseline;justify-content:center;gap:6px;
+             margin-top:-30px}
+  #leanVal{font-family:var(--mono);font-size:44px;font-weight:600;
+           font-variant-numeric:tabular-nums;letter-spacing:-1px;line-height:1}
+  #leanDeg{font-size:20px;color:var(--dim)}
+  #leanSide{text-align:center;font-size:10px;letter-spacing:.16em;
+            color:var(--dim);margin-top:4px}
+  .peaks{display:flex;justify-content:space-between;margin-top:10px;
+         padding-top:8px;border-top:1px solid rgba(255,255,255,.07);
+         font-family:var(--mono);font-size:10px;color:var(--dim)}
+  .peaks b{font-weight:600}
+  .pl b{color:var(--left)} .pr b{color:var(--right)}
+
+  /* speed + stats, bottom-right */
+  #right{position:absolute;right:22px;bottom:22px;display:flex;
+         flex-direction:column;align-items:flex-end;gap:10px}
+  .card{background:rgba(10,13,16,.62);border:1px solid rgba(255,255,255,.09);
+        border-radius:12px;backdrop-filter:blur(8px)}
+  #speedCard{padding:10px 16px 8px;text-align:right;min-width:150px}
+  #speedVal{font-family:var(--mono);font-size:40px;font-weight:600;line-height:1;
+            font-variant-numeric:tabular-nums;letter-spacing:-1px}
+  #speedVal.nofix{color:var(--dim);font-size:30px}
+  .unit{font-size:11px;color:var(--dim);letter-spacing:.14em;margin-top:2px}
+  #nofixNote{font-size:9px;color:var(--warn);letter-spacing:.08em;
+             margin-top:3px;display:none}
+  #nofixNote.on{display:block}
+
+  #stats{padding:9px 12px;display:grid;grid-template-columns:auto auto;
+         gap:3px 16px;font-family:var(--mono);font-size:11px}
+  #stats .k{color:var(--dim)}
+  #stats .v{text-align:right;font-variant-numeric:tabular-nums}
+
+  /* g-meter, top-right */
+  #gbox{position:absolute;right:22px;top:22px;padding:10px}
+  #gbox svg{display:block}
+  #gcap{text-align:center;font-family:var(--mono);font-size:9px;
+        color:var(--dim);letter-spacing:.1em;margin-top:4px}
+
+  /* clock, top-left */
+  #clock{position:absolute;left:22px;top:22px;padding:8px 12px;
+         font-family:var(--mono);font-size:11px;line-height:1.6}
+  #clock .t{font-size:16px;font-variant-numeric:tabular-nums}
+  #clock .u{color:var(--dim)}
+  #offBadge{color:var(--accent)}
+  #offBadge.zero{color:var(--dim)}
+
+  /* ------------------------------------------------------------- controls */
+  #bar{flex:none;background:var(--panel);border-top:1px solid var(--line);
+       padding:8px 14px 10px;display:flex;flex-direction:column;gap:8px}
+
+  /* lean trace */
+  #traceWrap{position:relative;height:74px}
+  #trace{display:block;width:100%;height:74px;cursor:crosshair;border-radius:6px;
+         background:#0e1216;border:1px solid var(--line)}
+  #traceHint{position:absolute;right:8px;top:6px;font-size:9px;color:var(--dim);
+             font-family:var(--mono);pointer-events:none;letter-spacing:.08em}
+
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .grow{flex:1;min-width:120px}
+
+  button{font:inherit;color:var(--ink);background:#1d232a;border:1px solid var(--line);
+         border-radius:7px;padding:5px 10px;cursor:pointer}
+  button:hover{background:#262e37;border-color:#39424d}
+  button:active{background:#161b21}
+  button.wide{min-width:44px}
+  #play{min-width:70px;font-weight:600}
+  .seg{display:flex;gap:0}
+  .seg button{border-radius:0;border-left-width:0;font-family:var(--mono);font-size:11px;
+              padding:5px 8px}
+  .seg button:first-child{border-radius:7px 0 0 7px;border-left-width:1px}
+  .seg button:last-child{border-radius:0 7px 7px 0}
+
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;
+                    background:var(--line);outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
+    border-radius:50%;background:var(--accent);cursor:pointer;border:0}
+  input[type=number]{font:inherit;font-family:var(--mono);width:74px;color:var(--ink);
+    background:#0e1216;border:1px solid var(--line);border-radius:6px;padding:4px 6px;
+    text-align:right}
+  label{color:var(--dim);font-size:11px;letter-spacing:.03em}
+  .sep{width:1px;align-self:stretch;background:var(--line);margin:0 2px}
+  .tag{font-family:var(--mono);font-size:11px;color:var(--dim);
+       font-variant-numeric:tabular-nums}
+
+  details{border-top:1px solid var(--line);padding-top:8px}
+  summary{cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:.04em;
+          list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"▸ ";color:var(--dim)}
+  details[open] summary::before{content:"▾ "}
+  #adv{display:flex;flex-direction:column;gap:8px;padding-top:8px}
+  #note{font-size:10px;color:var(--dim);font-family:var(--mono);line-height:1.6}
+  kbd{font-family:var(--mono);font-size:10px;background:#0e1216;border:1px solid var(--line);
+      border-radius:4px;padding:1px 4px;color:var(--ink)}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="gl"></canvas>
+    <video id="vid" crossorigin="anonymous" playsinline preload="auto"></video>
+
+    <div id="hud">
+      <div id="clock" class="card">
+        <div class="t"><span id="tVid">0:00.00</span></div>
+        <div class="u">utc <span id="tUtc">--:--:--</span></div>
+        <div class="u">data <span id="offBadge" class="zero">+0.00 s</span></div>
+      </div>
+
+      <div id="gbox" class="card">
+        <svg width="112" height="112" viewBox="-56 -56 112 112" aria-hidden="true">
+          <circle r="50" fill="rgba(0,0,0,.25)" stroke="#252c34"/>
+          <circle r="25" fill="none" stroke="#252c34" stroke-dasharray="2 3"/>
+          <line x1="-50" y1="0" x2="50" y2="0" stroke="#252c34"/>
+          <line x1="0" y1="-50" x2="0" y2="50" stroke="#252c34"/>
+          <path id="gtrail" fill="none" stroke="#5ac8fa" stroke-opacity=".45"
+                stroke-width="1.5" stroke-linejoin="round"/>
+          <circle id="gdot" r="4.5" fill="#5ac8fa"/>
+        </svg>
+        <div id="gcap">1 g RING</div>
+      </div>
+
+      <div id="lean">
+        <svg viewBox="0 0 220 118" aria-hidden="true">
+          <g id="ticks"></g>
+          <path id="arcBg" fill="none" stroke="#252c34" stroke-width="7"
+                stroke-linecap="round"/>
+          <path id="arcVal" fill="none" stroke="#5ac8fa" stroke-width="7"
+                stroke-linecap="round"/>
+          <line id="needle" x1="110" y1="104" x2="110" y2="34"
+                stroke="#e8edf2" stroke-width="2.5" stroke-linecap="round"/>
+          <circle cx="110" cy="104" r="4" fill="#e8edf2"/>
+        </svg>
+        <div class="lean-read"><span id="leanVal">0</span><span id="leanDeg">°</span></div>
+        <div id="leanSide">UPRIGHT</div>
+        <div class="peaks">
+          <span class="pl">LEFT PEAK <b id="peakL">0.0°</b></span>
+          <span class="pr"><b id="peakR">0.0°</b> RIGHT PEAK</span>
+        </div>
+      </div>
+
+      <div id="right">
+        <div id="speedCard" class="card">
+          <div id="speedVal">0</div>
+          <div class="unit">KM/H</div>
+          <div id="nofixNote">NO GPS FIX</div>
+        </div>
+        <div id="stats" class="card">
+          <span class="k">lean rate</span><span class="v" id="sLeanRate">–</span>
+          <span class="k">pitch</span><span class="v" id="sPitch">–</span>
+          <span class="k">yaw rate</span><span class="v" id="sYaw">–</span>
+          <span class="k">lat</span><span class="v" id="sAlat">–</span>
+          <span class="k">lon</span><span class="v" id="sAlon">–</span>
+          <span class="k">total</span><span class="v" id="sAtot">–</span>
+          <span class="k">alt</span><span class="v" id="sAlt">–</span>
+          <span class="k">imu</span><span class="v" id="sTemp">–</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="msg">loading…</div>
+  </div>
+
+  <div id="bar">
+    <div id="traceWrap">
+      <canvas id="trace"></canvas>
+      <div id="traceHint">LEAN — click or drag to seek</div>
+    </div>
+
+    <div class="row">
+      <button id="play">▶ Play</button>
+      <div class="seg">
+        <button id="fb" title="back one frame">⏴ frame</button>
+        <button id="ff" title="forward one frame">frame ⏵</button>
+      </div>
+      <input type="range" id="seek" class="grow" min="0" max="1000" value="0" step="1">
+      <span class="tag" id="dur">0:00 / 0:00</span>
+      <div class="sep"></div>
+      <label>speed</label>
+      <div class="seg" id="rates">
+        <button data-r="0.25">¼×</button><button data-r="0.5">½×</button>
+        <button data-r="1" class="on">1×</button><button data-r="2">2×</button>
+      </div>
+      <button id="mute">🔇 Unmute</button>
+      <div class="sep"></div>
+      <label for="fov">fov</label>
+      <input type="range" id="fov" min="40" max="120" value="95" step="1" style="width:80px">
+      <label for="roll">roll</label>
+      <input type="range" id="roll" min="-180" max="180" value="0" step="0.5" style="width:100px">
+      <span class="tag" id="rollVal">0°</span>
+      <button id="recentre">Recentre</button>
+    </div>
+
+    <div class="row" style="background:#0e1216;border:1px solid var(--line);
+         border-radius:8px;padding:7px 10px">
+      <label for="off" style="color:var(--accent);font-weight:600">DATA OFFSET</label>
+      <input type="range" id="off" class="grow" min="-10" max="10" value="0" step="0.001">
+      <input type="number" id="offNum" step="0.01" value="0">
+      <span class="tag">s</span>
+      <div class="seg">
+        <button data-d="-1" class="wide">−1s</button>
+        <button data-d="-0.1" class="wide">−.1</button>
+        <button data-d="-0.0334" class="wide">−1f</button>
+        <button data-d="0.0334" class="wide">+1f</button>
+        <button data-d="0.1" class="wide">+.1</button>
+        <button data-d="1" class="wide">+1s</button>
+      </div>
+      <button id="offZero">Reset</button>
+    </div>
+
+    <details>
+      <summary>Advanced — lean trim, sign, timebase</summary>
+      <div id="adv">
+        <div class="row">
+          <label for="trim" style="min-width:96px">LEAN TRIM</label>
+          <input type="range" id="trim" class="grow" min="-10" max="10" value="0" step="0.05">
+          <input type="number" id="trimNum" step="0.1" value="0">
+          <span class="tag">°</span>
+          <button id="trimZero">Reset</button>
+        </div>
+        <div class="row">
+          <label style="min-width:96px">LEAN SIGN</label>
+          <label><input type="checkbox" id="raw"> raw CSV sign — lean, yaw rate
+            and lateral g as <code>gopro-telemetry.py</code> wrote them.
+            Off (default) corrects the documented inversion, so + is a right-hand turn.</label>
+        </div>
+        <div class="row">
+          <label for="scale" style="min-width:96px">DATA RATE</label>
+          <input type="range" id="scale" class="grow" min="0.995" max="1.005"
+                 value="1" step="0.00001">
+          <input type="number" id="scaleNum" step="0.0001" value="1">
+          <span class="tag" id="scaleHz">–</span>
+          <button id="scaleZero">Reset</button>
+        </div>
+        <div id="note"></div>
+      </div>
+    </details>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   360 renderer.  A fullscreen quad; the fragment shader turns each pixel
+   into a view ray, rotates it by the camera orientation and samples the
+   equirectangular frame.  No mesh, so no polar pinching and no seam.
+   ===================================================================== */
+const VERT = `
+attribute vec2 p;
+void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const FRAG = `
+precision highp float;
+uniform sampler2D tex;
+uniform vec2  res;
+uniform mat3  cam;      // yaw/pitch rotation, camera -> world
+uniform float tanHalf;  // tan(vertical fov / 2)
+const float PI = 3.14159265359;
+void main(){
+  vec2 ndc = (gl_FragCoord.xy / res) * 2.0 - 1.0;
+  float aspect = res.x / res.y;
+  // yaw=pitch=0 looks down -Z, which maps to the centre of the equirect.
+  vec3 d = normalize(vec3(ndc.x * tanHalf * aspect, ndc.y * tanHalf, -1.0));
+  vec3 w = cam * d;
+  float lon = atan(w.x, -w.z);
+  float lat = asin(clamp(w.y, -1.0, 1.0));
+  vec2 uv = vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);
+  gl_FragColor = texture2D(tex, uv);
+}`;
+
+const cvs = document.getElementById('gl');
+const vid = document.getElementById('vid');
+const msg = document.getElementById('msg');
+
+let gl, prog, tex, uRes, uCam, uTan, texReady = false;
+
+function initGL(){
+  const opts = {antialias:false, depth:false, alpha:false,
+                preserveDrawingBuffer:false};
+  gl = cvs.getContext('webgl2', opts) || cvs.getContext('webgl', opts);
+  if(!gl) return false;
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // A 2560x1280 frame is not power-of-two, and WebGL1 renders NPOT textures
+  // black unless both axes clamp and filtering is mipmap-free.  uv never
+  // leaves [0,1] here, so clamping costs only a hairline seam at the rear.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  uRes = gl.getUniformLocation(prog, 'res');
+  uCam = gl.getUniformLocation(prog, 'cam');
+  uTan = gl.getUniformLocation(prog, 'tanHalf');
+  gl.uniform1i(gl.getUniformLocation(prog, 'tex'), 0);
+  return true;
+}
+
+/* camera.
+
+   This clip's stitch did not level: the equirect centre sits ~72 deg below the
+   forward horizon and the horizon is rolled, so a centred view is pure tarmac.
+   Hence a default pitch, and a roll axis -- without roll, footage like this
+   cannot be levelled by dragging at all. */
+const DEFAULT_VIEW = {yaw:0, pitch:72*Math.PI/180, roll:0, fov:95};
+const view = {...DEFAULT_VIEW};
+
+function camMatrix(){
+  // column-major mat3 for WebGL: Ry(yaw) * Rx(pitch) * Rz(roll).
+  // Roll is applied first, in camera space, so it spins the image about the
+  // view axis -- which is what levelling a tilted horizon needs.
+  const cy = Math.cos(view.yaw),   sy = Math.sin(view.yaw);
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  const cr = Math.cos(view.roll),  sr = Math.sin(view.roll);
+  return new Float32Array([
+    cy*cr + sy*sp*sr,   cp*sr,   -sy*cr + cy*sp*sr,   // col 0
+   -cy*sr + sy*sp*cr,   cp*cr,    sy*sr + cy*sp*cr,   // col 1
+    sy*cp,             -sp,       cy*cp               // col 2
+  ]);
+}
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(cvs.clientWidth  * dpr));
+  const h = Math.max(1, Math.round(cvs.clientHeight * dpr));
+  if(cvs.width !== w || cvs.height !== h){ cvs.width = w; cvs.height = h; }
+}
+
+function draw(){
+  if(!gl) return;
+  resize();
+  gl.viewport(0, 0, cvs.width, cvs.height);
+  if(texReady){
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    try{
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, vid);
+    }catch(e){ /* frame not decodable yet */ }
+  }
+  gl.uniform2f(uRes, cvs.width, cvs.height);
+  gl.uniformMatrix3fv(uCam, false, camMatrix());
+  gl.uniform1f(uTan, Math.tan(view.fov * Math.PI / 360));
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+/* drag to look */
+let dragging = false, lastX = 0, lastY = 0;
+cvs.addEventListener('pointerdown', e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  cvs.classList.add('drag'); cvs.setPointerCapture(e.pointerId);
+});
+cvs.addEventListener('pointermove', e => {
+  if(!dragging) return;
+  // Both axes drag "grab the world": the scene follows the pointer.
+  const k = (view.fov * Math.PI / 180) / cvs.clientHeight;
+  view.yaw   += (e.clientX - lastX) * k;
+  view.pitch += (e.clientY - lastY) * k;
+  const lim = Math.PI/2 - 0.001;
+  view.pitch = Math.max(-lim, Math.min(lim, view.pitch));
+  lastX = e.clientX; lastY = e.clientY;
+});
+const endDrag = () => {
+  if(dragging) saveView();
+  dragging = false; cvs.classList.remove('drag');
+};
+cvs.addEventListener('pointerup', endDrag);
+cvs.addEventListener('pointercancel', endDrag);
+cvs.addEventListener('wheel', e => {
+  e.preventDefault();
+  setFov(view.fov + Math.sign(e.deltaY) * 3);
+}, {passive:false});
+
+const fovEl = document.getElementById('fov');
+const rollEl = document.getElementById('roll');
+const rollVal = document.getElementById('rollVal');
+
+const VKEY = 'gopro-telemetry-viewer/view';
+function saveView(){
+  try{ localStorage.setItem(VKEY, JSON.stringify(view)); }catch(e){}
+}
+function loadView(){
+  try{
+    const s = JSON.parse(localStorage.getItem(VKEY) || '{}');
+    for(const k of ['yaw','pitch','roll','fov'])
+      if(typeof s[k] === 'number' && isFinite(s[k])) view[k] = s[k];
+  }catch(e){}
+}
+function syncView(){
+  fovEl.value = Math.round(view.fov);
+  rollEl.value = (view.roll * 180 / Math.PI).toFixed(1);
+  rollVal.textContent = (view.roll * 180 / Math.PI).toFixed(0) + '°';
+}
+function setFov(v){ view.fov = Math.max(40, Math.min(120, v)); syncView(); saveView(); }
+
+fovEl.addEventListener('input', () => setFov(+fovEl.value));
+rollEl.addEventListener('input', () => {
+  view.roll = (+rollEl.value) * Math.PI / 180; syncView(); saveView();
+});
+document.getElementById('recentre').onclick = () => {
+  Object.assign(view, DEFAULT_VIEW); syncView(); saveView();
+};
+
+/* =====================================================================
+   Telemetry
+   ===================================================================== */
+let T = null;                       // the loaded payload
+const A = {off:0, trim:0, raw:false, scale:1};    // alignment state
+
+/* gopro-telemetry.py's lean_deg is sign-inverted: its calibration fixes the
+   lean sign against the gyro's yaw rate, and that lateral axis is itself
+   flipped, so positive lean_deg is actually a LEFT turn.  Checked against GPS
+   course rate (r = -0.33 raw, and r = +0.95 against the camera's own yaw rate,
+   i.e. self-consistent but absolutely wrong) -- see README, "The lean sign
+   disagreement".  yaw_rate_dps and accel_lat_g ride the same flipped axis, so
+   all three are corrected together.  A.raw shows the CSV untouched.
+   accel_lon_g and pitch_deg are NOT affected: the forward axis was settled
+   against GPS dv/dt, which is unambiguous. */
+const LATERAL = new Set(['lean', 'leanrate', 'yaw', 'alat']);
+const sign = () => A.raw ? 1 : -1;
+
+const KEY = 'gopro-telemetry-viewer/align';
+function saveAlign(){
+  try{ localStorage.setItem(KEY, JSON.stringify(A)); }catch(e){}
+}
+function loadAlign(){
+  try{
+    const s = JSON.parse(localStorage.getItem(KEY) || '{}');
+    for(const k of ['off','trim','scale']) if(typeof s[k] === 'number') A[k] = s[k];
+    if(typeof s.raw === 'boolean') A.raw = s.raw;
+  }catch(e){}
+}
+
+/* Sample index for a video time, under the current offset and rate trim. */
+function idxAt(tVideo){
+  if(!T) return -1;
+  const t = (tVideo - A.off) * T.hz * A.scale;
+  const i = Math.round(t);
+  return (i < 0 || i >= T.n) ? -1 : i;
+}
+function get(key, i){
+  const c = T.ch[key];
+  if(!c || i < 0) return null;
+  const v = c[i];
+  if(v === null || v === undefined) return null;
+  return LATERAL.has(key) ? v * sign() : v;
+}
+function leanAt(i){
+  const v = get('lean', i);
+  return v === null ? null : v + A.trim;
+}
+
+/* =====================================================================
+   HUD
+   ===================================================================== */
+const LEAN_MAX = 50;                // gauge full scale, degrees each way
+const el = id => document.getElementById(id);
+const $leanVal = el('leanVal'), $leanSide = el('leanSide'),
+      $arcVal = el('arcVal'), $arcBg = el('arcBg'), $needle = el('needle'),
+      $peakL = el('peakL'), $peakR = el('peakR'),
+      $speed = el('speedVal'), $nofix = el('nofixNote'),
+      $gdot = el('gdot'), $gtrail = el('gtrail'),
+      $tVid = el('tVid'), $tUtc = el('tUtc'), $offBadge = el('offBadge');
+
+/* gauge geometry: an arc from -140deg to -40deg through the top */
+const CX = 110, CY = 104, R = 74;
+const A0 = 200, A1 = 340;           // svg degrees (0 = +x, clockwise)
+function polar(deg, r){
+  const a = deg * Math.PI / 180;
+  return [CX + r * Math.cos(a), CY + r * Math.sin(a)];
+}
+function arcPath(fromDeg, toDeg, r){
+  const [x0,y0] = polar(fromDeg, r), [x1,y1] = polar(toDeg, r);
+  const large = Math.abs(toDeg - fromDeg) > 180 ? 1 : 0;
+  const sweep = toDeg > fromDeg ? 1 : 0;
+  return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} ${sweep} ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+}
+const leanToDeg = v => A0 + (v + LEAN_MAX) / (2*LEAN_MAX) * (A1 - A0);
+
+$arcBg.setAttribute('d', arcPath(A0, A1, R));
+(function ticks(){
+  const g = el('ticks'); let s = '';
+  for(let v = -LEAN_MAX; v <= LEAN_MAX; v += 10){
+    const d = leanToDeg(v), major = (v % 20 === 0);
+    const [x0,y0] = polar(d, R - (major ? 13 : 9)), [x1,y1] = polar(d, R - 4);
+    s += `<line x1="${x0.toFixed(1)}" y1="${y0.toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y1.toFixed(1)}"
+           stroke="${major ? '#4a5764' : '#2b333c'}" stroke-width="${major ? 1.6 : 1}"/>`;
+    if(major && v !== 0){
+      const [tx,ty] = polar(d, R - 24);
+      s += `<text x="${tx.toFixed(1)}" y="${(ty+3).toFixed(1)}" fill="#5b6674"
+             font-size="9" font-family="${'ui-monospace,Menlo,monospace'}"
+             text-anchor="middle">${Math.abs(v)}</text>`;
+    }
+  }
+  g.innerHTML = s;
+})();
+
+let peakL = 0, peakR = 0;
+const gTrail = [];
+
+function fmtTime(s){
+  if(!isFinite(s)) return '0:00.00';
+  const m = Math.floor(s / 60), r = s - m * 60;
+  return `${m}:${r < 10 ? '0' : ''}${r.toFixed(2)}`;
+}
+function utcAt(i){
+  if(!T || !T.start_utc || i < 0) return '--:--:--';
+  const base = Date.parse(T.start_utc);
+  if(isNaN(base)) return '--:--:--';
+  const d = new Date(base + (i / T.hz) * 1000);
+  return d.toISOString().slice(11, 23);
+}
+
+function updateHUD(){
+  const t = vid.currentTime || 0;
+  const i = idxAt(t);
+
+  $tVid.textContent = fmtTime(t);
+  $tUtc.textContent = utcAt(i);
+  $offBadge.textContent = (A.off >= 0 ? '+' : '') + A.off.toFixed(2) + ' s';
+  $offBadge.className = Math.abs(A.off) < 0.005 ? 'zero' : '';
+
+  const lean = leanAt(i);
+  if(lean === null){
+    $leanVal.textContent = '–'; $leanSide.textContent = 'NO DATA';
+    $arcVal.setAttribute('d', '');
+  }else{
+    const a = Math.abs(lean);
+    $leanVal.textContent = a.toFixed(0);
+    $leanSide.textContent = a < 3 ? 'UPRIGHT' : (lean > 0 ? 'LEAN RIGHT' : 'LEAN LEFT');
+    const col = a < 3 ? '#5ac8fa' : (lean > 0 ? '#06d6a0' : '#ffd166');
+    $leanVal.style.color = col;
+    $arcVal.setAttribute('stroke', col);
+    const cl = Math.max(-LEAN_MAX, Math.min(LEAN_MAX, lean));
+    $arcVal.setAttribute('d', arcPath(leanToDeg(0), leanToDeg(cl), R));
+    const [nx,ny] = polar(leanToDeg(cl), R - 6);
+    $needle.setAttribute('x2', nx.toFixed(2));
+    $needle.setAttribute('y2', ny.toFixed(2));
+    if(lean < 0) peakL = Math.min(peakL, lean);
+    if(lean > 0) peakR = Math.max(peakR, lean);
+  }
+  $peakL.textContent = Math.abs(peakL).toFixed(1) + '°';
+  $peakR.textContent = peakR.toFixed(1) + '°';
+
+  const sp = get('speed', i);
+  if(sp === null){
+    $speed.textContent = '—'; $speed.classList.add('nofix'); $nofix.classList.add('on');
+  }else{
+    $speed.textContent = sp.toFixed(0);
+    $speed.classList.remove('nofix'); $nofix.classList.remove('on');
+  }
+
+  const set = (id, v, dp, unit) =>
+    el(id).textContent = (v === null) ? '–' : v.toFixed(dp) + unit;
+  set('sLeanRate', get('leanrate', i), 0, ' °/s');
+  set('sPitch',    get('pitch', i),    1, '°');
+  set('sYaw',      get('yaw', i),      0, ' °/s');
+  set('sAlat',     get('alat', i),     2, ' g');
+  set('sAlon',     get('alon', i),     2, ' g');
+  set('sAtot',     get('atot', i),     2, ' g');
+  set('sAlt',      get('alt', i),      0, ' m');
+  set('sTemp',     get('temp', i),     1, '°C');
+
+  // g-meter: lateral right = +x, drive = +y (up)
+  const gx = get('alat', i), gy = get('alon', i);
+  if(gx !== null && gy !== null){
+    const px = Math.max(-52, Math.min(52, gx * 25));
+    const py = Math.max(-52, Math.min(52, -gy * 25));
+    $gdot.setAttribute('cx', px.toFixed(1));
+    $gdot.setAttribute('cy', py.toFixed(1));
+    gTrail.push([px, py]);
+    if(gTrail.length > 45) gTrail.shift();
+    $gtrail.setAttribute('d', 'M ' + gTrail.map(p =>
+      p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' L '));
+  }
+}
+
+/* ------------------------------------------------------------ lean trace */
+const trc = el('trace'), tctx = trc.getContext('2d');
+const WINDOW = 24;                  // seconds shown either side of the playhead
+
+function drawTrace(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = trc.clientWidth, h = trc.clientHeight;
+  if(trc.width !== w*dpr || trc.height !== h*dpr){
+    trc.width = w*dpr; trc.height = h*dpr;
+  }
+  tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tctx.clearRect(0, 0, w, h);
+  if(!T) return;
+
+  const t = vid.currentTime || 0;
+  const t0 = t - WINDOW, t1 = t + WINDOW;
+  const mid = h/2, sc = (h/2 - 6) / LEAN_MAX;
+  const X = tt => (tt - t0) / (t1 - t0) * w;
+
+  // grid
+  tctx.strokeStyle = '#1b2128'; tctx.lineWidth = 1;
+  for(const v of [-40,-20,20,40]){
+    const y = mid - v*sc;
+    tctx.beginPath(); tctx.moveTo(0, y); tctx.lineTo(w, y); tctx.stroke();
+  }
+  tctx.strokeStyle = '#2b333c';
+  tctx.beginPath(); tctx.moveTo(0, mid); tctx.lineTo(w, mid); tctx.stroke();
+
+  // no-fix shading, so gaps in the GPS are visible while aligning
+  if(T.gps_valid){
+    tctx.fillStyle = 'rgba(239,71,111,.07)';
+    let run = null;
+    for(let tt = t0; tt <= t1; tt += 0.1){
+      const i = idxAt(tt);
+      const bad = (i < 0) || !T.gps_valid[i];
+      if(bad && run === null) run = tt;
+      if(!bad && run !== null){
+        tctx.fillRect(X(run), 0, X(tt)-X(run), h); run = null;
+      }
+    }
+    if(run !== null) tctx.fillRect(X(run), 0, X(t1)-X(run), h);
+  }
+
+  // the lean curve, split at data gaps
+  tctx.lineWidth = 1.6; tctx.strokeStyle = '#5ac8fa';
+  tctx.beginPath();
+  let pen = false;
+  const step = (t1 - t0) / Math.max(1, w);
+  for(let px = 0; px <= w; px++){
+    const tt = t0 + px*step;
+    const v = leanAt(idxAt(tt));
+    if(v === null){ pen = false; continue; }
+    const y = mid - Math.max(-LEAN_MAX, Math.min(LEAN_MAX, v))*sc;
+    if(pen) tctx.lineTo(px, y); else { tctx.moveTo(px, y); pen = true; }
+  }
+  tctx.stroke();
+
+  // playhead
+  const xp = X(t);
+  tctx.strokeStyle = '#e8edf2'; tctx.lineWidth = 1.5;
+  tctx.beginPath(); tctx.moveTo(xp, 0); tctx.lineTo(xp, h); tctx.stroke();
+  tctx.fillStyle = '#e8edf2';
+  tctx.beginPath(); tctx.moveTo(xp-4, 0); tctx.lineTo(xp+4, 0);
+  tctx.lineTo(xp, 6); tctx.closePath(); tctx.fill();
+
+  // axis labels
+  tctx.fillStyle = '#4a5764';
+  tctx.font = '9px ui-monospace,Menlo,monospace';
+  tctx.fillText('+40 R', 4, mid - 40*sc + 3);
+  tctx.fillText('-40 L', 4, mid + 40*sc + 3);
+  tctx.textAlign = 'right';
+  tctx.fillText(`±${WINDOW}s`, w - 6, h - 5);
+  tctx.textAlign = 'left';
+}
+
+let scrubbing = false;
+function traceSeek(e){
+  const r = trc.getBoundingClientRect();
+  const f = (e.clientX - r.left) / r.width;
+  const t = (vid.currentTime || 0) + (f - 0.5) * 2 * WINDOW;
+  vid.currentTime = Math.max(0, Math.min(vid.duration || 0, t));
+}
+trc.addEventListener('pointerdown', e => {
+  scrubbing = true; trc.setPointerCapture(e.pointerId); traceSeek(e);
+});
+trc.addEventListener('pointermove', e => { if(scrubbing) traceSeek(e); });
+trc.addEventListener('pointerup', () => scrubbing = false);
+trc.addEventListener('pointercancel', () => scrubbing = false);
+
+/* =====================================================================
+   Playback controls
+   ===================================================================== */
+const $play = el('play'), $seek = el('seek'), $dur = el('dur'), $mute = el('mute');
+const FRAME = 1001/30000;
+
+$play.onclick = () => vid.paused ? vid.play() : vid.pause();
+vid.addEventListener('play',  () => $play.textContent = '❚❚ Pause');
+vid.addEventListener('pause', () => $play.textContent = '▶ Play');
+el('fb').onclick = () => { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - FRAME); };
+el('ff').onclick = () => { vid.pause(); vid.currentTime = Math.min(vid.duration||0, vid.currentTime + FRAME); };
+
+let seekDrag = false;
+$seek.addEventListener('pointerdown', () => seekDrag = true);
+$seek.addEventListener('pointerup',   () => seekDrag = false);
+$seek.addEventListener('input', () => {
+  if(vid.duration) vid.currentTime = (+$seek.value / 1000) * vid.duration;
+});
+// Peak-hold reflects the stretch actually watched, so a deliberate seek clears it.
+vid.addEventListener('seeked', () => { peakL = 0; peakR = 0; gTrail.length = 0; });
+vid.addEventListener('timeupdate', () => {
+  if(!seekDrag && vid.duration) $seek.value = Math.round(vid.currentTime / vid.duration * 1000);
+  $dur.textContent = `${fmtShort(vid.currentTime)} / ${fmtShort(vid.duration)}`;
+});
+const fmtShort = s => {
+  if(!isFinite(s)) return '0:00';
+  const m = Math.floor(s/60), r = Math.floor(s%60);
+  return `${m}:${r<10?'0':''}${r}`;
+};
+
+el('rates').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(!b) return;
+  vid.playbackRate = +b.dataset.r;
+  [...e.currentTarget.children].forEach(c => c.classList.toggle('on', c === b));
+});
+$mute.onclick = () => {
+  vid.muted = !vid.muted;
+  $mute.textContent = vid.muted ? '🔇 Unmute' : '🔊 Mute';
+};
+
+/* =====================================================================
+   Alignment controls
+   ===================================================================== */
+function bindPair(rangeId, numId, key, apply){
+  const r = el(rangeId), n = el(numId);
+  const push = v => {
+    A[key] = v;
+    r.value = v; n.value = +v.toFixed(key === 'scale' ? 5 : 3);
+    saveAlign(); apply && apply(); refresh();
+  };
+  r.addEventListener('input', () => push(+r.value));
+  n.addEventListener('change', () => {
+    let v = +n.value;
+    if(!isFinite(v)) v = 0;
+    v = Math.max(+r.min, Math.min(+r.max, v));
+    push(v);
+  });
+  return push;
+}
+const setOff   = bindPair('off',   'offNum',   'off');
+const setTrim  = bindPair('trim',  'trimNum',  'trim');
+const setScale = bindPair('scale', 'scaleNum', 'scale', () => showHz());
+
+document.querySelectorAll('[data-d]').forEach(b => {
+  b.onclick = () => setOff(+(A.off + (+b.dataset.d)).toFixed(4));
+});
+el('offZero').onclick   = () => setOff(0);
+el('trimZero').onclick  = () => setTrim(0);
+el('scaleZero').onclick = () => setScale(1);
+el('raw').addEventListener('change', e => {
+  A.raw = e.target.checked; saveAlign();
+  peakL = 0; peakR = 0; gTrail.length = 0; refresh();
+});
+
+function showHz(){
+  if(!T) return;
+  el('scaleHz').textContent = (T.hz * A.scale).toFixed(5) + ' Hz';
+}
+
+/* keyboard: [ ] nudge by a frame, shift for a second, space plays */
+addEventListener('keydown', e => {
+  if(e.target.matches('input,button,summary')) return;
+  const big = e.shiftKey;
+  if(e.key === '['){ setOff(+(A.off - (big ? 1 : FRAME)).toFixed(4)); e.preventDefault(); }
+  else if(e.key === ']'){ setOff(+(A.off + (big ? 1 : FRAME)).toFixed(4)); e.preventDefault(); }
+  else if(e.code === 'Space'){ vid.paused ? vid.play() : vid.pause(); e.preventDefault(); }
+  else if(e.key === 'ArrowLeft'){
+    vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - (big ? 1 : FRAME));
+    e.preventDefault();
+  }
+  else if(e.key === 'ArrowRight'){
+    vid.pause();
+    vid.currentTime = Math.min(vid.duration||0, vid.currentTime + (big ? 1 : FRAME));
+    e.preventDefault();
+  }
+});
+
+/* =====================================================================
+   Boot
+   ===================================================================== */
+function refresh(){ updateHUD(); drawTrace(); }
+
+function tick(){
+  draw(); refresh();
+  requestAnimationFrame(tick);
+}
+
+async function boot(){
+  if(!initGL()){
+    msg.textContent = 'This browser has no WebGL, so the 360 view cannot render.';
+    return;
+  }
+  loadAlign();
+  loadView();
+  syncView();
+
+  let r;
+  try{
+    r = await fetch('telemetry.json');
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    T = await r.json();
+  }catch(err){
+    msg.textContent = 'Could not load telemetry.json\n' + err.message;
+    return;
+  }
+
+  el('off').value = A.off;     el('offNum').value = A.off.toFixed(3);
+  el('trim').value = A.trim;   el('trimNum').value = A.trim.toFixed(1);
+  el('scale').value = A.scale; el('scaleNum').value = A.scale.toFixed(5);
+  el('raw').checked = A.raw;
+  showHz();
+
+  el('note').innerHTML =
+    `${T.clip} — ${T.n} samples at ${T.hz.toFixed(5)} Hz ` +
+    `(${T.hz_note}); GPS fix ${T.gps_fix_pct}% of samples. ` +
+    (T.video_dur_s && T.video_dur_s < T.dur_s - 1
+      ? `Video covers the first ${T.video_dur_s.toFixed(0)} s of ` +
+        `${T.dur_s.toFixed(0)} s of telemetry. `
+      : '') +
+    `Lean, yaw rate and lateral g are sign-corrected (+ = right-hand turn); ` +
+    `the CSV has them inverted. ` +
+    `Nudge with <kbd>[</kbd> <kbd>]</kbd> (a frame) or ` +
+    `<kbd>shift</kbd>+<kbd>[</kbd> <kbd>]</kbd> (a second); ` +
+    `<kbd>←</kbd> <kbd>→</kbd> step the video, <kbd>space</kbd> plays. ` +
+    `Offset, trim and rate persist in this browser.`;
+
+  vid.src = 'video';
+  vid.muted = true;
+  vid.addEventListener('loadeddata', () => {
+    texReady = true; msg.classList.add('hide');
+  });
+  vid.addEventListener('error', () => {
+    const c = vid.error ? vid.error.code : 0;
+    msg.classList.remove('hide');
+    msg.textContent =
+      'The browser refused to decode this video (media error ' + c + ').\n\n' +
+      'Safari plays 10-bit HEVC; Chrome often will not.\n' +
+      'Transcode a proxy and point the viewer at that:\n\n' +
+      'ffmpeg -i INPUT.mp4 -vf scale=2560:1280 -c:v h264_videotoolbox \\\n' +
+      '  -b:v 12M -pix_fmt yuv420p -c:a aac -movflags +faststart proxy.mp4';
+  });
+
+  addEventListener('resize', refresh);
+  tick();
+}
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+//! `gmax` — a GoPro Max 2 toolkit.
+//!
+//! The library half exists so integration tests can drive the same code paths
+//! the CLI does. See `src/main.rs` for the command surface.
+
+pub mod fourcc;
+pub mod gpmf;
+pub mod math;
+pub mod mp4;
+pub mod telemetry;
+
+pub use fourcc::FourCc;

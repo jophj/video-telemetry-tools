@@ -1,0 +1,9 @@
+/target
+/sources
+*.telemetry.csv
+*.gpx
+*.merged.gpx
+*_equirect.mp4
+*_proxy.mp4
+*_highlights/
+.DS_Store
