@@ -37,23 +37,67 @@ fn master_timeline_runs_at_the_ntsc_rate() {
 }
 
 #[test]
-fn gps_quality_gate_matches_the_prototype_and_is_driven_by_dop() {
-    let t = telemetry_or_skip!();
-    assert_eq!(t.gps.len(), 15375);
-
-    // The prototype's viewer reported gps_fix_pct 54.9 for this clip.
+fn gps_quality_gate_matches_the_prototype_when_reduced_to_its_checks() {
+    let path = fixture_or_skip!(common::REFERENCE_360);
+    let mut f = gmax::mp4::Mp4::open(&path).unwrap();
+    let g = gmax::gpmf::from_mp4(&mut f).unwrap();
+    // With the plausibility check off, the gate is the prototype's: dilution of
+    // precision and a null position. The prototype's viewer reported
+    // gps_fix_pct 54.9 for this clip.
+    let t = telemetry::compute(
+        &g,
+        &telemetry::Options {
+            max_speed_ratio: 0.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let pct = t.fix_percentage();
     assert!((pct - 54.9).abs() < 0.1, "fix percentage was {pct}");
-
-    // Every rejection here is for dilution of precision. This camera leaves the
-    // GPS9 fix field at 0 for all 15375 samples, so gating on it would reject
-    // the whole recording; DOP is the signal that actually works.
-    assert!(t.gps.iter().all(|f| f.fix == Some(0)));
     assert!(t
         .gps
         .iter()
         .filter(|f| !f.valid)
         .all(|f| f.reject == Some(Reject::HighDop)));
+}
+
+#[test]
+fn the_plausibility_check_rejects_what_dop_cannot_see() {
+    let t = telemetry_or_skip!();
+
+    // This camera reports a DOP between 3.04 and 3.31 for every fix it accepts
+    // -- a near-constant value that is plainly not a live quality estimate --
+    // while its position track jumps. So a second check compares each fix
+    // against the receiver's own Doppler speed, and it rejects fixes DOP alone
+    // would have passed.
+    let implausible = t
+        .gps
+        .iter()
+        .filter(|f| f.reject == Some(Reject::Implausible))
+        .count();
+    assert!(implausible > 0, "the plausibility check caught nothing");
+    // A small share: this is a filter, not a rewrite.
+    let share = implausible as f64 / t.gps.len() as f64;
+    assert!(share < 0.1, "rejected {:.1}% as implausible", share * 100.0);
+    let pct = t.fix_percentage();
+    assert!((50.0..55.0).contains(&pct), "fix percentage was {pct}");
+}
+
+#[test]
+fn gps_fix_field_is_unusable_on_this_camera() {
+    let t = telemetry_or_skip!();
+    assert_eq!(t.gps.len(), 15375);
+
+    // Every sample reports fix type 0, including the 55% with a three-metre
+    // lock, so gating on `fix >= 2` would reject the entire recording. The
+    // field is therefore only honoured when a recording ever reports a
+    // non-zero value.
+    assert!(t.gps.iter().all(|f| f.fix == Some(0)));
+    assert!(t.valid_fix_count() > 8000, "the whole recording was rejected");
+    assert!(t
+        .warnings
+        .iter()
+        .any(|w| w.contains("fix type 0")), "the quality report should say so");
 
     // Sample 0: the camera has no lock, DOP pinned at the 99.99 sentinel and a
     // position off the coast of Norway rather than in the Apennines.

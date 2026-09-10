@@ -8,6 +8,7 @@ pub mod fourcc;
 pub mod gpx;
 pub mod gpmf;
 pub mod math;
+pub mod merge;
 pub mod mp4;
 pub mod telemetry;
 

@@ -47,6 +47,20 @@ pub struct Options {
     /// vibration through its accelerometer, so a short window measures road
     /// buzz rather than the load on the machine.
     pub accel_window_s: f64,
+    /// Reject a fix that moved this many times faster than the receiver's own
+    /// reported speed says it could have. Zero disables the check.
+    ///
+    /// This catches what dilution of precision cannot. On the reference clip
+    /// the camera reports a DOP between 3.04 and 3.31 for every fix it accepts
+    /// -- a near-constant value that plainly is not a live quality estimate --
+    /// while its position track jumps: a tenth of the steps imply a speed more
+    /// than 50 % above the Doppler speed the same receiver reports, peaking at
+    /// 1646 km/h. Doppler speed is reliable where position is not (their median
+    /// ratio is 1.008), so it makes a good independent reference.
+    pub max_speed_ratio: f64,
+    /// Allowance added to the speed limit above, in m/s, so that ordinary
+    /// receiver noise between adjacent fixes is not mistaken for a jump.
+    pub speed_floor_ms: f64,
 }
 
 impl Default for Options {
@@ -56,6 +70,8 @@ impl Default for Options {
             frozen_run: 30,
             gyro_window_s: 0.02,
             accel_window_s: 0.2,
+            max_speed_ratio: 2.0,
+            speed_floor_ms: 10.0,
         }
     }
 }
@@ -90,6 +106,7 @@ pub enum Reject {
     HighDop,
     NullIsland,
     Frozen,
+    Implausible,
 }
 
 impl Reject {
@@ -99,6 +116,7 @@ impl Reject {
             Reject::HighDop => "dilution of precision too high",
             Reject::NullIsland => "position is exactly 0,0",
             Reject::Frozen => "position frozen after loss of lock",
+            Reject::Implausible => "position inconsistent with the receiver's own speed",
         }
     }
 }
@@ -903,6 +921,7 @@ fn parse_gps9(s: &Series, opts: &Options) -> Vec<GpsFix> {
         });
     }
     flag_frozen(&mut out, opts.frozen_run);
+    flag_implausible(&mut out, opts.max_speed_ratio, opts.speed_floor_ms);
     out
 }
 
@@ -938,6 +957,7 @@ fn parse_gps5(s: &Series, opts: &Options) -> Vec<GpsFix> {
         });
     }
     flag_frozen(&mut out, opts.frozen_run);
+    flag_implausible(&mut out, opts.max_speed_ratio, opts.speed_floor_ms);
     out
 }
 
@@ -948,6 +968,44 @@ fn gps9_time(days: f64, secs: f64) -> Option<DateTime<Utc>> {
     let whole = GPS_EPOCH_UNIX + (days as i64) * 86_400 + secs.trunc() as i64;
     let nanos = ((secs - secs.trunc()) * 1e9).round() as u32;
     Utc.timestamp_opt(whole, nanos.min(999_999_999)).single()
+}
+
+/// Reject fixes whose displacement disagrees with the reported speed.
+///
+/// Walks forward holding the last *accepted* fix as the anchor, so a single
+/// spike is rejected without also condemning the good fix that follows it. The
+/// anchor is reset at a coverage gap, since the bike really did travel during
+/// one and the displacement across it is legitimate.
+fn flag_implausible(gps: &mut [GpsFix], ratio: f64, floor_ms: f64) {
+    if ratio <= 0.0 {
+        return;
+    }
+    let mut anchor: Option<usize> = None;
+    for i in 0..gps.len() {
+        if !gps[i].valid {
+            continue;
+        }
+        let Some(a) = anchor else {
+            anchor = Some(i);
+            continue;
+        };
+        let dt = gps[i].time - gps[a].time;
+        // A gap means the bike went somewhere unobserved; start again.
+        if dt <= 0.0 || dt > 1.0 {
+            anchor = Some(i);
+            continue;
+        }
+        let moved = haversine(gps[a].lat, gps[a].lon, gps[i].lat, gps[i].lon);
+        // The receiver's own speed at either end bounds how far it can have got.
+        let speed = gps[a].speed_2d.max(gps[i].speed_2d);
+        let allowed = (speed * ratio + floor_ms) * dt;
+        if moved > allowed {
+            gps[i].valid = false;
+            gps[i].reject = Some(Reject::Implausible);
+        } else {
+            anchor = Some(i);
+        }
+    }
 }
 
 /// Mark runs of bit-identical positions as stale.
