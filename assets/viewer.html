@@ -804,7 +804,7 @@ document.querySelectorAll('[data-d]').forEach(b => {
 el('offZero').onclick   = () => setOff(0);
 el('trimZero').onclick  = () => setTrim(0);
 el('scaleZero').onclick = () => setScale(1);
-el('raw').addEventListener('change', e => {
+el('flipLateral').addEventListener('change', e => {
   A.flipLateral = e.target.checked; saveAlign();
   peakL = 0; peakR = 0; gTrail.length = 0; refresh();
 });
