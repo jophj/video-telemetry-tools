@@ -24,6 +24,20 @@ use crate::math::*;
 /// can do, and neither should be filtered away.
 pub const ACCEL_CEILING_MS2: f64 = 15.0;
 
+/// Degrees by which a reported lean may differ from what the lateral
+/// acceleration at the same instant supports, before it is called into
+/// question.
+///
+/// A real corner does lean a few degrees further than `atan(a_lat / g)`: the
+/// contact patch sits inboard of the tyre's centreline as the machine rolls
+/// over, and on a motorcycle tyre that is worth two or three degrees at full
+/// lean. Past this the two channels are not describing the same corner.
+///
+/// The band is symmetric even though the physics is not, because an *under*
+/// reading is the same fault seen from the other side: both mean the angle is
+/// being measured against the wrong idea of upright.
+pub const LEAN_SUPPORT_TOLERANCE_DEG: f64 = 8.0;
+
 /// One sample of a ride, from whichever source.
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
@@ -640,6 +654,10 @@ pub fn analyse(samples: &[Sample], opts: &Options) -> anyhow::Result<Analysis> {
         ));
     }
 
+    if let Some(m) = metrics.iter().find(|m| m.id == MetricId::Lean) {
+        warnings.extend(lean_support_warning(&m.entries, samples));
+    }
+
     let distance_m = distance_over(samples, cadence.gap_threshold);
 
     Ok(Analysis {
@@ -851,6 +869,59 @@ fn to_entries(
         .collect()
 }
 
+/// Check the reported lean peaks against the lateral acceleration measured at
+/// the same instant.
+///
+/// Lean is an angle against a *calibrated* idea of upright; lateral g is a
+/// force measured against gravity, in the gravity frame, and so does not
+/// depend on that calibration at all. When a peak's two readings disagree by
+/// more than tyre geometry can explain, the one to disbelieve is the lean, and
+/// what is usually wrong with it is the roll zero — which is exactly the error
+/// `telemetry`'s rolling baseline exists to remove. This is the check that
+/// catches whatever the baseline misses, most importantly on a source that had
+/// too little straight-line riding for a baseline to be fitted at all.
+///
+/// It reports the worst offender rather than a list: the fault is systematic,
+/// so the peaks fail together and one worked example says more than five.
+/// Silent when the samples carry no lateral acceleration — a GPX track does
+/// not — because there is then nothing to check against.
+fn lean_support_warning(entries: &[Entry], samples: &[Sample]) -> Option<String> {
+    let mut worst: Option<(&Entry, f64, f64, f64)> = None;
+    let mut failures = 0usize;
+    for e in entries {
+        // Lean is an instant metric, so an entry's time is its sample's time.
+        let i = samples.partition_point(|s| s.t < e.t);
+        let Some(alat) = samples.get(i).filter(|s| s.t == e.t).and_then(|s| s.accel_lat_g) else {
+            continue;
+        };
+        let supported = alat.atan().to_degrees();
+        let gap = (e.value - supported).abs();
+        if gap <= LEAN_SUPPORT_TOLERANCE_DEG {
+            continue;
+        }
+        failures += 1;
+        if worst.is_none_or(|(_, _, _, w)| gap > w) {
+            worst = Some((e, alat, supported, gap));
+        }
+    }
+    let (e, alat, supported, gap) = worst?;
+    Some(format!(
+        "lean #{} reports {:.0}° but the {:+.2} g measured across the machine at that instant \
+         supports {:.0}°, a {:.0}° disagreement{}. Lateral g is read against gravity and owes \
+         nothing to the mount calibration, so it is the lean angle to distrust here: check that \
+         upright reads zero either side of this corner.",
+        e.rank,
+        e.value.abs(),
+        alat,
+        supported.abs(),
+        gap,
+        match failures {
+            1 => String::new(),
+            n => format!(", the worst of {n} lean moments that disagree"),
+        },
+    ))
+}
+
 // ---------------------------------------------------------------- adapters
 
 /// Build samples from camera telemetry.
@@ -869,11 +940,7 @@ pub fn samples_from_telemetry(t: &crate::telemetry::Telemetry) -> Vec<Sample> {
         while i + 1 < t.n && t.times[i + 1] <= fix.time {
             i += 1;
         }
-        let time = match fix.utc.or_else(|| {
-            t.t0.map(|t0| {
-                t0 + chrono::Duration::microseconds((fix.time * 1e6).round() as i64)
-            })
-        }) {
+        let time = match fix.utc.or_else(|| t.utc_of(fix.time)) {
             Some(x) => x,
             None => continue,
         };

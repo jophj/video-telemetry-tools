@@ -130,3 +130,44 @@ fn circular_mean_averages_across_north() {
     // Diametrically opposed angles have no mean direction.
     assert!(circular_mean(&[0.0, 180.0]).is_none());
 }
+
+#[test]
+fn rotation_preserves_length_and_the_angles_between_vectors() {
+    let axis = normalize(&[0.3, -0.7, 0.5]);
+    let th = 0.42_f64;
+    let a = normalize(&[1.0, 2.0, -0.5]);
+    let b = normalize(&[-0.2, 0.4, 0.9]);
+    let (ra, rb) = (rotate_about(&a, &axis, th), rotate_about(&b, &axis, th));
+    assert!((magnitude(&ra) - 1.0).abs() < 1e-12, "length changed");
+    // The property the gravity-reference correction rests on: rotating both
+    // sides of an angle leaves the angle alone, which is why putting GRAV back
+    // on the vertical cannot move the lean angle measured against it.
+    assert!((dot(&a, &b) - dot(&ra, &rb)).abs() < 1e-12);
+    // A vector on the axis is fixed, and a full turn is the identity.
+    let on = rotate_about(&axis, &axis, th);
+    assert!(sub(&on, &axis).iter().all(|d| d.abs() < 1e-12));
+    let round = rotate_about(&a, &axis, std::f64::consts::TAU);
+    assert!(sub(&round, &a).iter().all(|d| d.abs() < 1e-12));
+    // Right-handed: +90° about Z takes X to Y.
+    let r = rotate_about(&[1.0, 0.0, 0.0], &[0.0, 0.0, 1.0], std::f64::consts::FRAC_PI_2);
+    assert!((r[1] - 1.0).abs() < 1e-12, "got {r:?}");
+}
+
+#[test]
+fn median_vec_ignores_outliers_on_every_axis() {
+    // One wild sample per axis must not move the answer -- which is the whole
+    // reason the gravity-reference rotation is averaged this way rather than
+    // with a mean, since a motorcycle's accelerometer produces outliers by the
+    // thousand.
+    let vs = vec![
+        [1.0, 10.0, 100.0],
+        [1.1, 10.1, 100.1],
+        [0.9, 9.9, 99.9],
+        [1.2, 10.2, 100.2],
+        [900.0, -700.0, 40000.0],
+    ];
+    let m = median_vec(&vs);
+    assert!((m[0] - 1.1).abs() < 1e-9, "got {m:?}");
+    assert!((m[1] - 10.0).abs() < 1e-9, "got {m:?}");
+    assert!((m[2] - 100.1).abs() < 1e-9, "got {m:?}");
+}

@@ -228,9 +228,7 @@ pub fn slots_from_telemetry(t: &Telemetry) -> Vec<Slot> {
         while i + 1 < t.n && t.times[i + 1] <= fix.time {
             i += 1;
         }
-        let time = match fix.utc.or_else(|| {
-            t.t0.map(|t0| t0 + Duration::microseconds((fix.time * 1e6).round() as i64))
-        }) {
+        let time = match fix.utc.or_else(|| t.utc_of(fix.time)) {
             Some(x) => x,
             None => continue, // no clock, so nothing to align against
         };
@@ -310,6 +308,72 @@ pub fn slots_from_gpx(base: &Gpx) -> Vec<Slot> {
         });
     }
     slots
+}
+
+/// Write merged positions back onto the camera telemetry they came from.
+///
+/// [`merge`] produces a GPX, which is the right output for a track and the
+/// wrong one for the moments engine. A GPX carries lean angle and longitudinal
+/// acceleration and nothing else, so ranking a ride from one silently drops
+/// the lateral and total-load metrics — they come off the camera's IMU and
+/// have no GPX representation. Putting the repaired positions back where they
+/// came from keeps both: the external receiver's positions, and the full set
+/// of channels the camera measured.
+///
+/// Matching is by video time, which both sides carry and which no clock offset
+/// can disturb: the merge may shift the *external* timestamps to align them,
+/// but a slot's position in the recording is fixed. Returns how many fixes
+/// were repaired.
+pub fn apply_to_telemetry(t: &mut Telemetry, merged: &Gpx) -> usize {
+    // Video times of the camera's own fixes, ascending, for bisection.
+    let fix_times: Vec<f64> = t.gps.iter().map(|f| f.time).collect();
+    let mut repaired = 0;
+    for p in &merged.points {
+        let Some(vt) = p.video_time_s else { continue };
+        // The nearest fix either side, then whichever is closer. Half a fix
+        // interval is the most a correctly matched point can be away.
+        let i = fix_times.partition_point(|&x| x < vt);
+        let cand = [i.checked_sub(1), (i < fix_times.len()).then_some(i)];
+        let Some(j) = cand
+            .into_iter()
+            .flatten()
+            .min_by(|&a, &b| {
+                (fix_times[a] - vt)
+                    .abs()
+                    .partial_cmp(&(fix_times[b] - vt).abs())
+                    .unwrap()
+            })
+            .filter(|&j| (fix_times[j] - vt).abs() < 0.05)
+        else {
+            continue;
+        };
+        let fix = &mut t.gps[j];
+        // A point the merge could not place leaves the fix as it found it,
+        // rejected and with its reason intact.
+        if p.source.as_deref() == Some("interpolated") && !fix.valid {
+            continue;
+        }
+        fix.lat = p.lat;
+        fix.lon = p.lon;
+        if let Some(e) = p.ele_m {
+            fix.alt_m = e;
+        }
+        if let Some(s) = p.speed_ms {
+            fix.speed_2d = s;
+        }
+        fix.course_deg = p.course_deg;
+        fix.source = match p.source.as_deref() {
+            Some("external") => Source::External,
+            Some("interpolated") => Source::Interpolated,
+            _ => Source::Gopro,
+        };
+        if !fix.valid {
+            repaired += 1;
+        }
+        fix.valid = true;
+        fix.reject = None;
+    }
+    repaired
 }
 
 /// Merge an external GPX into a base timeline.

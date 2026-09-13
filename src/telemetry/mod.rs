@@ -28,6 +28,67 @@ const GPS_EPOCH_UNIX: i64 = 946_684_800;
 /// `GPS9` reports this DOP when it has nothing to report.
 const DOP_SENTINEL: f64 = 99.98;
 
+/// A sample counts as upright reference material above this speed, in m/s.
+///
+/// Below walking pace the machine is being held up by a foot rather than by
+/// its own momentum, and gravity in the mount frame says nothing about which
+/// way the vehicle considers up.
+const UPRIGHT_MIN_SPEED_MS: f64 = 5.0;
+
+/// ...and below this rate of turn, in degrees per second.
+const UPRIGHT_MAX_TURN_DPS: f64 = 2.0;
+
+/// Half-width of the window each roll-zero point is taken over, in seconds.
+///
+/// Long enough to span the corners either side of a straight, short enough to
+/// follow a mount that creeps over a twenty-minute ride.
+const ROLL_ZERO_HALF_WINDOW_S: f64 = 30.0;
+
+/// Widened half-width, used where the narrow window is too sparse.
+const ROLL_ZERO_WIDE_HALF_WINDOW_S: f64 = 90.0;
+
+/// Upright samples one baseline point needs before the narrow window is used.
+const ROLL_ZERO_MIN_LOCAL: usize = 40;
+
+/// Upright samples a baseline point needs before it is preferred to the
+/// whole-file median.
+const ROLL_ZERO_MIN_WIDE: usize = 10;
+
+/// Upright samples the file needs before the roll zero is tracked at all.
+const ROLL_ZERO_MIN_TOTAL: usize = 200;
+
+/// Spacing of the baseline grid, in seconds.
+///
+/// The baseline is a median over a minute of riding, so it cannot move
+/// meaningfully between adjacent 30 Hz samples. Evaluating it once a second
+/// and interpolating turns a per-sample sort into a per-second one.
+const ROLL_ZERO_GRID_S: f64 = 1.0;
+
+/// Baseline points averaged together to take the step out of the grid.
+const ROLL_ZERO_SMOOTH: usize = 11;
+
+/// Drift across the ride, in degrees, beyond which the mount is worth a word.
+const ROLL_ZERO_DRIFT_WARN_DEG: f64 = 4.0;
+
+/// Longitudinal acceleration below which the machine counts as coasting, in
+/// m/s².
+///
+/// Loose, because it is measured by differentiating GPS speed and that is a
+/// noisy thing to do. It does not need to be tight: what it has to exclude is
+/// hard braking and hard drive, and what it is used for tolerates the rest.
+const COAST_MAX_ACCEL_MS2: f64 = 0.3;
+
+/// Coasting samples needed before the gravity reference is trusted.
+const GRAV_TILT_MIN_SAMPLES: usize = 200;
+
+/// A `GRAV`-to-accelerometer disagreement beyond this, in degrees, is not a
+/// sensor misalignment but a sign that one of the two streams is not what this
+/// code thinks it is. It is reported and not applied.
+const GRAV_TILT_MAX_DEG: f64 = 30.0;
+
+/// A tilt worth mentioning in the quality report, in degrees.
+const GRAV_TILT_WARN_DEG: f64 = 2.0;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Reject fixes whose dilution of precision is at or above this.
@@ -61,6 +122,13 @@ pub struct Options {
     /// Allowance added to the speed limit above, in m/s, so that ordinary
     /// receiver noise between adjacent fixes is not mistaken for a jump.
     pub speed_floor_ms: f64,
+    /// Put `GRAV` back on the vertical the accelerometer measures before
+    /// deriving anything from it. See [`GravTilt`].
+    ///
+    /// On by default and there is no good reason to turn it off on real
+    /// footage; it exists so that the corrected and uncorrected channels can
+    /// be compared, which is how the correction is tested.
+    pub correct_grav: bool,
 }
 
 impl Default for Options {
@@ -72,6 +140,7 @@ impl Default for Options {
             accel_window_s: 0.2,
             max_speed_ratio: 2.0,
             speed_floor_ms: 10.0,
+            correct_grav: true,
         }
     }
 }
@@ -155,6 +224,78 @@ pub struct LeanSign {
     pub confidence: Confidence,
 }
 
+/// The fixed tilt between `GRAV` and the accelerometer's own vertical.
+///
+/// `GRAV` is the camera's *fused estimate* of which way is down, not a
+/// measurement, and on this camera it is several degrees out. Where the
+/// machine is rolling straight and neither braking nor driving, the only force
+/// acting on it is gravity — so the accelerometer, which measures force, **is**
+/// the vertical. On the reference ride the two disagree by a median 8°,
+/// steadily, from one end of the recording to the other.
+///
+/// It matters because of *which* channels trust `GRAV` absolutely. Lean and
+/// pitch are angles against a reference fitted from `GRAV` itself, so a fixed
+/// tilt cancels out of them entirely. The road-frame acceleration channels do
+/// not have that luxury: they resolve force against `GRAV` directly, with
+/// nothing to cancel against. So the tilt lands in them whole, and a machine
+/// riding dead straight reported 0.09 g across itself — 5° of cornering load
+/// that was not there, which is enough to make `accel_lat` disagree with the
+/// lean angle it is supposed to corroborate.
+///
+/// Unlike [`LeanZero`] this is *not* tracked over time, and not because it was
+/// easier. The roll zero describes where the camera sits on the machine, which
+/// a slipping mount changes. This describes how two sensors inside one camera
+/// disagree with each other, which no amount of mount movement can affect — so
+/// the whole recording is one measurement of it, and using all of it is the
+/// accurate thing to do rather than the lazy one.
+#[derive(Debug, Clone)]
+pub struct GravTilt {
+    /// Size of the correction, in degrees.
+    pub angle_deg: f64,
+    /// Axis it was applied about, in the camera's frame.
+    pub axis: Vec3,
+    /// Coasting samples it was measured over.
+    pub samples: usize,
+    /// False when the tilt was measured but judged too large to be a sensor
+    /// misalignment, and so left uncorrected.
+    pub applied: bool,
+}
+
+/// The slowly-varying roll zero removed from the lean angle.
+///
+/// [`calibrate_mount`] fits one upright reference for the whole file, so the
+/// zero it produces is only right on average. On a real ride the reading a
+/// genuinely upright machine produces wanders — the mount creeps, the rider
+/// re-seats the camera, the helmet it is stuck to moves on the rider's head —
+/// and on the reference footage that wander spans 12° across twenty minutes.
+/// A single static zero therefore reports a corner at whatever end of that
+/// band it happens to fall in: a 43° left-hander sitting in a −6° pocket comes
+/// out as 49°, five degrees clear of a field it should have tied with.
+///
+/// So the same fit is made again locally: the median lean over the upright
+/// samples within [`ROLL_ZERO_HALF_WINDOW_S`] of each instant, subtracted from
+/// the lean angle. Upright riding then reads zero wherever it occurs, which is
+/// the property the whole-file fit only has on average.
+#[derive(Debug, Clone)]
+pub struct LeanZero {
+    /// Upright samples the baseline was fitted from.
+    pub samples: usize,
+    /// Half-width of the window each baseline point was taken over, in seconds.
+    pub window_s: f64,
+    /// Smallest and largest offset removed, in degrees.
+    pub range_deg: (f64, f64),
+    /// The baseline itself, on the master timeline, already subtracted from
+    /// [`Telemetry::lean_deg`]. Add it back to recover the raw angle.
+    pub offset_deg: Vec<f64>,
+}
+
+impl LeanZero {
+    /// How far the zero moved across the ride, in degrees.
+    pub fn drift_deg(&self) -> f64 {
+        self.range_deg.1 - self.range_deg.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
     /// Confirmed against GPS, and lean tracks the turn rate strongly.
@@ -208,6 +349,12 @@ pub struct Telemetry {
     gps_index: Vec<Option<usize>>,
 
     pub lean_sign: LeanSign,
+    /// The roll zero tracked out of `lean_deg`, when there was enough
+    /// straight-line riding to track it.
+    pub lean_zero: Option<LeanZero>,
+    /// The `GRAV`-to-accelerometer tilt, when there was enough coasting to
+    /// measure it.
+    pub grav_tilt: Option<GravTilt>,
     pub warnings: Vec<String>,
     pub device_name: Option<String>,
 }
@@ -227,11 +374,101 @@ impl Telemetry {
         self.valid_fix_at(i).map(|f| f.speed_2d)
     }
 
+    /// A sub-range of this telemetry, carrying its calibration.
+    ///
+    /// The point of it: a clip cut out of a ride cannot calibrate itself. The
+    /// roll zero needs straight-line riding and the gravity reference needs
+    /// coasting, and eleven seconds of one corner has neither — so telemetry
+    /// derived from the clip alone falls back to a mount fit made from that one
+    /// corner and comes out degrees wrong. See [`LeanZero`] and [`GravTilt`].
+    /// Slicing the parent instead gives the clip the calibration of the whole
+    /// ride, which is the only place it could have come from.
+    ///
+    /// Timestamps are re-based so the slice starts at zero, because that is
+    /// what a standalone file's timeline means. `t0` moves with them, so
+    /// absolute time is preserved.
+    pub fn slice(&self, from: usize, to: usize) -> Telemetry {
+        let (from, to) = (from.min(self.n), to.min(self.n));
+        let n = to.saturating_sub(from);
+        let origin = self.times.get(from).copied().unwrap_or(0.0);
+        let t0 = self.utc_of(origin);
+        let cut = |v: &[f64]| v[from..to].to_vec();
+        let cut_opt = |v: &Option<Vec<f64>>| v.as_ref().map(|v| cut(v));
+
+        // The fixes landing inside the slice, re-based onto its clock. The
+        // bound is the end of the *last sample*, not the start, or a fix in the
+        // final sample period would be dropped.
+        let span_end = self.times.get(to.saturating_sub(1)).copied().unwrap_or(origin);
+        let gps: Vec<GpsFix> = self
+            .gps
+            .iter()
+            .filter(|f| f.time >= origin && f.time <= span_end)
+            .map(|f| GpsFix { time: f.time - origin, ..f.clone() })
+            .collect();
+        let times: Vec<f64> = self.times[from..to].iter().map(|t| t - origin).collect();
+        let gps_index = build_gps_index(&times, &gps);
+
+        Telemetry {
+            n,
+            hz: self.hz,
+            hz_nominal: self.hz_nominal,
+            duration_s: times.last().copied().unwrap_or(0.0) - times.first().copied().unwrap_or(0.0),
+            times,
+            t0,
+            t0_is_fallback: self.t0_is_fallback,
+            lean_deg: cut(&self.lean_deg),
+            pitch_deg: cut(&self.pitch_deg),
+            yaw_rate_dps: cut(&self.yaw_rate_dps),
+            lean_rate_dps: cut_opt(&self.lean_rate_dps),
+            pitch_rate_dps: cut_opt(&self.pitch_rate_dps),
+            accel_lon_g: cut_opt(&self.accel_lon_g),
+            accel_lat_g: cut_opt(&self.accel_lat_g),
+            accel_vert_g: cut_opt(&self.accel_vert_g),
+            accel_total_g: cut_opt(&self.accel_total_g),
+            imu_temp_c: cut_opt(&self.imu_temp_c),
+            gps,
+            gps_index,
+            lean_sign: self.lean_sign.clone(),
+            // `range_deg` and `samples` deliberately stay the parent's: they
+            // describe the fit, and the fit was made over the whole ride. Only
+            // the offsets actually subtracted here are sliced.
+            lean_zero: self.lean_zero.as_ref().map(|z| LeanZero {
+                offset_deg: cut(&z.offset_deg),
+                ..z.clone()
+            }),
+            grav_tilt: self.grav_tilt.clone(),
+            warnings: Vec::new(),
+            device_name: self.device_name.clone(),
+        }
+    }
+
+    /// The sample range covering `[start, end]` on this source's timeline.
+    ///
+    /// Half-open, in the form [`slice`](Self::slice) takes.
+    pub fn range_covering(&self, start: f64, end: f64) -> (usize, usize) {
+        let from = self.times.partition_point(|&t| t < start);
+        let to = self.times.partition_point(|&t| t <= end);
+        (from.min(self.n), to.min(self.n))
+    }
+
+    /// Absolute time at a point on this source's own timeline.
+    ///
+    /// Measured from `times[0]`, which is what `t0` is anchored to, and not
+    /// from zero. The two are the same thing on a whole recording, where the
+    /// first sample lands a frame or two in. They are emphatically not the same
+    /// on a clip cut out of one: a stream copy keeps the GPMF's original
+    /// timestamps, so an eighteen-minutes-in clip has a timeline starting at
+    /// 1098 s, and treating that as an offset from `t0` put its UTC eighteen
+    /// minutes into the future.
+    pub fn utc_of(&self, time_s: f64) -> Option<DateTime<Utc>> {
+        let t0 = self.t0?;
+        let micros = ((time_s - self.times[0]) * 1e6).round() as i64;
+        Some(t0 + chrono::Duration::microseconds(micros))
+    }
+
     /// Absolute time of master sample `i`.
     pub fn utc_at(&self, i: usize) -> Option<DateTime<Utc>> {
-        let t0 = self.t0?;
-        let micros = (self.times[i] * 1e6).round() as i64;
-        Some(t0 + chrono::Duration::microseconds(micros))
+        self.utc_of(*self.times.get(i)?)
     }
 
     pub fn valid_fix_count(&self) -> usize {
@@ -347,6 +584,22 @@ impl Telemetry {
     }
 }
 
+/// The master timeline a source carries, without deriving anything from it.
+///
+/// Cheap where [`compute`] is not: no calibration, no GPS gate, no warnings.
+/// It exists so that a clip can be matched back to the recording it was cut
+/// from. A stream copy keeps the GPMF's original timestamps, so a clip's
+/// timeline is a verbatim sub-range of its parent's and the two line up sample
+/// for sample — which is what makes the parent's calibration transferable
+/// rather than merely approximate.
+pub fn timeline(gpmf: &Gpmf) -> Option<Vec<f64>> {
+    let series = gpmf.series();
+    let device_id = pick_device(&series);
+    series
+        .get(&(device_id, FourCc::from_str_lossy("GRAV")))
+        .map(|s| s.times.clone())
+}
+
 /// Compute rider channels from a parsed GPMF stream.
 pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
     let series = gpmf.series();
@@ -373,7 +626,7 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
     let duration_s = times[n - 1] - times[0];
 
     // Gravity as a unit vector. GRAV points *up* in the camera's frame.
-    let grav: Vec<Vec3> = (0..n)
+    let mut grav: Vec<Vec3> = (0..n)
         .map(|i| {
             let s = grav_series.sample(i);
             normalize(&[s[0], s[1], s[2]])
@@ -432,13 +685,80 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
             .map(|f| f.speed_2d)
     };
 
+    // --- gravity reference -------------------------------------------------
+    // Put `GRAV` back on the vertical the accelerometer measures, before
+    // anything uses it. See [`GravTilt`]: this has to happen here, ahead of the
+    // mount calibration, because the tilt is in the channel every later step
+    // reads — and the acceleration channels, which resolve force against
+    // `GRAV` with nothing to cancel against, inherit the whole of it.
+    let grav_tilt = match accel.as_deref().filter(|_| opts.correct_grav) {
+        None => None,
+        Some(acc) => {
+            let dv = speed_derivative(&times, &speed_at, n, hz);
+            let provisional = turn_rate_series(gyro.as_deref(), &grav, n);
+            let rotations: Vec<Vec3> = (0..n)
+                .filter(|&i| {
+                    speed_at(i).unwrap_or(0.0) > UPRIGHT_MIN_SPEED_MS
+                        && provisional[i].to_degrees().abs() < UPRIGHT_MAX_TURN_DPS
+                        && dv[i].abs() < COAST_MAX_ACCEL_MS2
+                })
+                // Rolling straight and neither braking nor driving: the only
+                // force here is gravity, so the accelerometer points along the
+                // true vertical and this cross product is the rotation that
+                // takes `GRAV` onto it.
+                .map(|i| cross(&grav[i], &normalize(&acc[i])))
+                .collect();
+            (rotations.len() >= GRAV_TILT_MIN_SAMPLES).then(|| {
+                let r = median_vec(&rotations);
+                let angle = magnitude(&r).clamp(-1.0, 1.0).asin();
+                let applied = angle.to_degrees() <= GRAV_TILT_MAX_DEG;
+                let axis = normalize(&r);
+                if applied {
+                    for g in grav.iter_mut() {
+                        *g = normalize(&rotate_about(g, &axis, angle));
+                    }
+                }
+                GravTilt {
+                    angle_deg: angle.to_degrees(),
+                    axis,
+                    samples: rotations.len(),
+                    applied,
+                }
+            })
+        }
+    };
+    match &grav_tilt {
+        None => warnings.push(
+            "no coasting, straight-line riding in this source, so GRAV could not be checked \
+             against the accelerometer. The road-frame acceleration channels rest on the \
+             camera's own idea of vertical, which on this camera has been several degrees out."
+                .into(),
+        ),
+        Some(t) if !t.applied => warnings.push(format!(
+            "GRAV disagrees with the accelerometer by {:.1}°, which is too much to be a sensor \
+             misalignment. It has been left alone: something about this recording's GRAV or ACCL \
+             stream is not what it appears to be, and the acceleration channels are suspect.",
+            t.angle_deg,
+        )),
+        Some(t) if t.angle_deg > GRAV_TILT_WARN_DEG => warnings.push(format!(
+            "GRAV sat {:.1}° off the vertical the accelerometer measures, over {} coasting \
+             samples. It has been corrected; without that, straight-line riding reports \
+             cornering load it is not carrying.",
+            t.angle_deg, t.samples,
+        )),
+        Some(_) => {}
+    }
+
     // --- mount calibration -------------------------------------------------
     // Two passes: an initial guess over the whole clip, then a refit over the
     // straight-line samples only, where gravity really is the vehicle's "up".
     let (mut up_ref, mut lat_ax) = calibrate_mount(&grav, None);
     let mut yaw = turn_rate_series(gyro.as_deref(), &grav, n);
     let straight: Vec<usize> = (0..n)
-        .filter(|&i| speed_at(i).unwrap_or(0.0) > 5.0 && yaw[i].to_degrees().abs() < 2.0)
+        .filter(|&i| {
+            speed_at(i).unwrap_or(0.0) > UPRIGHT_MIN_SPEED_MS
+                && yaw[i].to_degrees().abs() < UPRIGHT_MAX_TURN_DPS
+        })
         .collect();
     if straight.len() > 30.max((0.02 * n as f64) as usize) {
         let (u, l) = calibrate_mount(&grav, Some(&straight));
@@ -479,6 +799,51 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
                 .unwrap_or_else(|| "n/a (no usable GPS)".into()),
         ));
     }
+
+    // --- roll zero ---------------------------------------------------------
+    // Track the zero locally rather than trusting the whole-file fit. See
+    // [`LeanZero`] for why a static zero misreports individual corners, and
+    // note that this runs over `straight` — the very samples the static fit
+    // was made from — so it is the same measurement, just not averaged flat.
+    let lean_zero = match rolling_roll_zero(&lean, &times, &straight) {
+        Some(offset) => {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for (v, z) in lean.iter_mut().zip(&offset) {
+                *v -= z;
+                lo = lo.min(*z);
+                hi = hi.max(*z);
+            }
+            let zero = LeanZero {
+                samples: straight.len(),
+                window_s: ROLL_ZERO_HALF_WINDOW_S,
+                range_deg: (lo, hi),
+                offset_deg: offset,
+            };
+            if zero.drift_deg() > ROLL_ZERO_DRIFT_WARN_DEG {
+                warnings.push(format!(
+                    "the upright reading drifted {:.1}° over this recording ({:+.1}° to {:+.1}°), \
+                     which is the mount moving rather than the rider. It has been tracked out of \
+                     the lean angle, but a mount that will not hold still limits how much any \
+                     lean figure is worth.",
+                    zero.drift_deg(),
+                    zero.range_deg.0,
+                    zero.range_deg.1,
+                ));
+            }
+            Some(zero)
+        }
+        None => {
+            warnings.push(format!(
+                "only {} straight-line sample(s) here, too few to track the roll zero: lean is \
+                 reported against a single whole-file mount calibration, which can be several \
+                 degrees out at any given instant. A short clip cut out of a longer ride will \
+                 disagree with the ride it came from.",
+                straight.len(),
+            ));
+            None
+        }
+    };
 
     // --- forward polarity --------------------------------------------------
     // Which end of the lateral axis is "right" is settled; which end of the
@@ -610,6 +975,8 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
         gps,
         gps_index,
         lean_sign,
+        lean_zero,
+        grav_tilt,
         warnings,
         device_name,
     })
@@ -752,6 +1119,77 @@ fn calibrate_mount(grav: &[Vec3], reference: Option<&[usize]>) -> (Vec3, Vec3) {
     // Keep only the part perpendicular to up, so lean and pitch stay separable.
     let lat_ax = normalize(&reject(&axis, &up_ref));
     (up_ref, lat_ax)
+}
+
+/// The lean angle a genuinely upright machine reads, as it varies over the
+/// ride.
+///
+/// `upright` is the ascending list of master samples that were rolling fast
+/// enough and straight enough to be standing on their own wheels — the same
+/// set [`calibrate_mount`] was fitted from. The median lean over the ones near
+/// each instant is what upright reads there, and subtracting it leaves an
+/// angle measured against the machine rather than against the mount.
+///
+/// A median, not a mean: a corner that creeps under
+/// [`UPRIGHT_MAX_TURN_DPS`] — a long motorway sweeper, a roundabout taken
+/// wide — is a real lean wrongly admitted to the reference set, and a mean
+/// would let it drag the zero towards itself.
+///
+/// Returns `None` when there is too little straight-line riding to say
+/// anything, which is the honest answer for a clip cut out of a single corner.
+pub fn rolling_roll_zero(lean: &[f64], times: &[f64], upright: &[usize]) -> Option<Vec<f64>> {
+    let n = lean.len();
+    if upright.len() < ROLL_ZERO_MIN_TOTAL || n == 0 {
+        return None;
+    }
+    // The reference samples, as parallel time and angle arrays. `upright` is
+    // ascending, so `ref_t` is too and can be bisected.
+    let ref_t: Vec<f64> = upright.iter().map(|&i| times[i]).collect();
+    let ref_lean: Vec<f64> = upright.iter().map(|&i| lean[i]).collect();
+    let overall = median(&ref_lean);
+
+    // Everything between the first and last reference sample is interpolated;
+    // outside that span the nearest grid point is held, so a ride that starts
+    // or ends mid-corner keeps the zero of the riding either side of it rather
+    // than inventing one.
+    let span = times[n - 1] - times[0];
+    let steps = (span / ROLL_ZERO_GRID_S).ceil().max(1.0) as usize;
+    let mut grid = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        let t = times[0] + k as f64 * ROLL_ZERO_GRID_S;
+        let window = |half: f64| -> (usize, usize) {
+            (
+                ref_t.partition_point(|&x| x < t - half),
+                ref_t.partition_point(|&x| x <= t + half),
+            )
+        };
+        let (a, b) = window(ROLL_ZERO_HALF_WINDOW_S);
+        let (a, b) = if b - a >= ROLL_ZERO_MIN_LOCAL {
+            (a, b)
+        } else {
+            window(ROLL_ZERO_WIDE_HALF_WINDOW_S)
+        };
+        grid.push(if b - a >= ROLL_ZERO_MIN_WIDE {
+            median(&ref_lean[a..b])
+        } else {
+            overall
+        });
+    }
+    // Adjacent windows overlap by all but a second, so the grid is already
+    // smooth; this only takes the corner off the step where a dense block of
+    // reference samples enters or leaves a window.
+    let grid = moving_average(&grid, ROLL_ZERO_SMOOTH);
+
+    Some(
+        (0..n)
+            .map(|i| {
+                let pos = ((times[i] - times[0]) / ROLL_ZERO_GRID_S).clamp(0.0, steps as f64);
+                let lo = pos.floor() as usize;
+                let hi = (lo + 1).min(steps);
+                grid[lo] + (grid[hi] - grid[lo]) * (pos - lo as f64)
+            })
+            .collect(),
+    )
 }
 
 /// Rate of turn about the vertical, in radians per second, positive to the

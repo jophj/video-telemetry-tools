@@ -291,3 +291,48 @@ fn measures_the_cameras_gps_latency_on_real_material() {
     assert!(report.external_preferred_on_quality);
     assert!(report.points_external > report.points_gopro);
 }
+
+#[test]
+fn merged_positions_go_back_onto_the_fixes_they_replace() {
+    let base_path = fixture_or_skip!(common::REFERENCE_360);
+    let ext_path = fixture_or_skip!(common::EXTERNAL_GPX);
+
+    let mut f = gmax::mp4::Mp4::open(&base_path).unwrap();
+    let g = gmax::gpmf::from_mp4(&mut f).unwrap();
+    let mut t = gmax::telemetry::compute(&g, &Default::default()).unwrap();
+    let before_valid = t.valid_fix_count();
+    let before_lean = t.lean_deg.clone();
+    let before_alat = t.accel_lat_g.clone();
+
+    let external = gmax::gpx::read_file(&ext_path).unwrap();
+    let slots = merge::slots_from_telemetry(&t);
+    let (merged, _) = merge::merge(&slots, &external, &Options::default());
+    let repaired = merge::apply_to_telemetry(&mut t, &merged);
+
+    // Writing back must not change the shape of the timeline: the fixes are
+    // the same fixes, at the same instants, with better positions in them.
+    assert_eq!(t.gps.len(), slots.len(), "fix count changed");
+    assert!(
+        t.valid_fix_count() >= before_valid,
+        "a merge that repairs positions cannot lose good ones: {} -> {}",
+        before_valid,
+        t.valid_fix_count()
+    );
+    assert_eq!(
+        t.valid_fix_count() - before_valid,
+        repaired,
+        "the repaired count must match the fixes that became usable"
+    );
+
+    // The point of writing back rather than ranking the merged GPX: the IMU
+    // channels are untouched, so the lateral and total-load metrics that have
+    // no GPX representation survive the merge.
+    assert_eq!(before_lean, t.lean_deg, "lean must not move");
+    assert_eq!(before_alat, t.accel_lat_g, "lateral load must not move");
+
+    // Every repaired fix carries a position now, and says where it came from.
+    for fix in t.gps.iter().filter(|f| f.source != gmax::telemetry::Source::Gopro) {
+        assert!(fix.valid, "a substituted fix must be usable");
+        assert!(fix.lat.is_finite() && fix.lon.is_finite());
+    }
+}

@@ -11,6 +11,10 @@ use gmax::moments::{self, MetricId, Options, Sample};
 /// half-cycles and therefore about 30 corners. Speed is a 40 s sine about
 /// 25 m/s, whose derivative peaks at 10 * 2π/40 = 1.571 m/s². Those two figures
 /// are the ground truth every cadence must recover.
+///
+/// Lateral g is `tan(lean)`, the load a machine at that angle would actually
+/// be carrying, rather than a constant. A ride that leans 40° while measuring
+/// 0.02 g across itself is not a ride, and the engine now says so.
 fn synthetic(hz: f64, duration_s: f64, jitter: f64) -> Vec<Sample> {
     use std::f64::consts::TAU;
     let n = (duration_s * hz) as usize;
@@ -27,7 +31,7 @@ fn synthetic(hz: f64, duration_s: f64, jitter: f64) -> Vec<Sample> {
                 speed_ms: Some(25.0 + 10.0 * (t * TAU / 40.0).sin()),
                 lean_deg: Some(40.0 * (t * TAU / 8.0).sin()),
                 accel_lon_g: Some(0.01),
-                accel_lat_g: Some(0.02),
+                accel_lat_g: Some((40.0 * (t * TAU / 8.0).sin()).to_radians().tan()),
                 accel_total_g: Some(1.0),
                 video_time_s: Some(t),
             }
@@ -469,4 +473,70 @@ fn chapters_are_untouched_without_a_duration_limit() {
     let out = gmax::moments::clips::shift_ffmetadata(text, 5.0, None);
     assert!(out.contains("START=5000\n"), "got:\n{out}");
     assert!(out.contains("END=15000\n"), "got:\n{out}");
+}
+
+/// A ride of identical corners, leaning `lean` degrees with `supported`
+/// degrees' worth of lateral load measured across the machine.
+fn corners(lean: f64, supported: f64) -> Vec<Sample> {
+    use std::f64::consts::TAU;
+    let t0 = 1_788_601_214.0f64;
+    (0..1200)
+        .map(|i| {
+            let t = i as f64 / 10.0;
+            let shape = (t * TAU / 20.0).sin();
+            Sample {
+                t: t0 + t,
+                pos: Some((44.17, 11.33)),
+                speed_ms: Some(20.0),
+                lean_deg: Some(lean * shape),
+                accel_lat_g: Some((supported * shape).to_radians().tan()),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn lean_warning(samples: &[Sample]) -> Option<String> {
+    let a = moments::analyse(
+        samples,
+        &Options {
+            metrics: vec![MetricId::Lean],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    a.warnings.into_iter().find(|w| w.starts_with("lean #"))
+}
+
+#[test]
+fn a_lean_the_lateral_load_cannot_support_is_flagged() {
+    // 45 degrees of lean measured against 0.58 g -- the load of a 30-degree
+    // corner. Lateral g is read against gravity and owes nothing to the mount
+    // calibration, so the disagreement means the angle is being measured
+    // against the wrong idea of upright. This is the shape of the fault that
+    // put a 43-degree corner into the clip index as 49.
+    let w = lean_warning(&corners(45.0, 30.0)).expect("a 15-degree disagreement should be flagged");
+    assert!(w.contains("45°"), "{w}");
+    assert!(w.contains("30°"), "{w}");
+    assert!(w.contains("15°"), "{w}");
+
+    // An under-reading is the same fault seen from the other side.
+    assert!(lean_warning(&corners(20.0, 35.0)).is_some());
+}
+
+#[test]
+fn lean_that_the_lateral_load_supports_passes_quietly() {
+    // A real corner leans a few degrees further than atan(a_lat / g) -- the
+    // contact patch sits inboard of the tyre's centreline -- so agreement
+    // means close, not exact.
+    assert_eq!(lean_warning(&corners(40.0, 36.0)), None);
+    assert_eq!(lean_warning(&corners(40.0, 40.0)), None);
+
+    // Nothing to check against is not a finding: a GPX track carries lean but
+    // no lateral acceleration, and must not be accused on that account.
+    let mut blind = corners(45.0, 30.0);
+    for s in &mut blind {
+        s.accel_lat_g = None;
+    }
+    assert_eq!(lean_warning(&blind), None);
 }

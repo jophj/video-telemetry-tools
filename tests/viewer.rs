@@ -148,3 +148,26 @@ fn the_viewer_page_no_longer_compensates_for_fixed_bugs() {
     // viewer would restore the old always-on flip.
     assert!(html.contains("gopro-telemetry-viewer/align2"));
 }
+
+#[test]
+fn a_csv_that_does_not_start_at_zero_reports_its_length_not_its_end() {
+    // A clip cut by a stream copy keeps the GPMF's original timestamps, so
+    // `gmax telemetry` on an eighteen-minutes-in clip produces a CSV whose
+    // time_s column starts at 1098. Reading the last value as the duration
+    // made the viewer think an eleven-second clip was eighteen minutes long,
+    // and squeezed its whole trace into the first percent of the scrubber.
+    let head = "time_s,utc,lat,lon,alt_m,speed_kmh,speed_3d_kmh,course_deg,lean_deg,\
+lean_rate_dps,pitch_deg,pitch_rate_dps,yaw_rate_dps,accel_lon_g,accel_lat_g,accel_vert_g,\
+accel_total_g,gps_dop,imu_temp_c,gps_valid\n";
+    let row = |t: f64| {
+        format!("{t:.3},2026-09-12T11:16:03.411Z,,,,,,,-14.67,-0.1,-1.09,-0.7,0.2,0.005,-0.000,0.004,1.004,,46.2,0\n")
+    };
+    let csv = format!("{head}{}{}{}", row(1098.157), row(1098.190), row(1098.224));
+    let v: serde_json::Value =
+        serde_json::from_str(&gmax::telemetry::output::json_from_csv(&csv, None, None).unwrap())
+            .unwrap();
+    let dur = v["dur_s"].as_f64().unwrap();
+    assert!((dur - 0.067).abs() < 1e-3, "dur_s was {dur}, expected the span");
+    // The rate is still measured correctly from the same column.
+    assert!((v["hz"].as_f64().unwrap() - 29.9).abs() < 1.0, "hz {}", v["hz"]);
+}

@@ -56,6 +56,32 @@ pub fn reject(v: &Vec3, axis: &Vec3) -> Vec3 {
     sub(v, &scale(axis, d))
 }
 
+/// Rotate `v` by `angle` radians about the unit vector `axis`, right-handed.
+///
+/// Rodrigues' formula. Written out rather than built from a matrix because
+/// there is only ever one axis in play and the matrix would be assembled,
+/// used once per sample and thrown away.
+pub fn rotate_about(v: &Vec3, axis: &Vec3, angle: f64) -> Vec3 {
+    let (s, c) = angle.sin_cos();
+    let k = cross(axis, v);
+    let d = dot(axis, v) * (1.0 - c);
+    [
+        v[0] * c + k[0] * s + axis[0] * d,
+        v[1] * c + k[1] * s + axis[1] * d,
+        v[2] * c + k[2] * s + axis[2] * d,
+    ]
+}
+
+/// Component-wise median of a set of vectors.
+///
+/// Not the geometric median, and deliberately: this is used to average a
+/// cloud of small rotation vectors, where the point is to be unmoved by the
+/// outliers that a motorcycle's accelerometer produces in quantity.
+pub fn median_vec(vs: &[Vec3]) -> Vec3 {
+    let axis = |k: usize| median(&vs.iter().map(|v| v[k]).collect::<Vec<_>>());
+    [axis(0), axis(1), axis(2)]
+}
+
 /// Centred box filter of width `w`, clipped at the edges.
 ///
 /// Matches the prototype's `_movavg`: the window is `[i - w/2, i + w/2]`

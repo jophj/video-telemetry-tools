@@ -8,9 +8,9 @@ use super::{Source, Telemetry};
 /// The CSV column order, unchanged from the prototype so that anything already
 /// reading `*.telemetry.csv` keeps working.
 ///
-/// `gps_fix` and `gps_source` are appended rather than inserted, for the same
-/// reason: a reader indexing by position is unaffected, and one indexing by
-/// name gains two columns it can ignore.
+/// `gps_fix`, `gps_source` and `lean_zero_deg` are appended rather than
+/// inserted, for the same reason: a reader indexing by position is unaffected,
+/// and one indexing by name gains columns it can ignore.
 pub const COLUMNS: &[&str] = &[
     "time_s",
     "utc",
@@ -34,6 +34,9 @@ pub const COLUMNS: &[&str] = &[
     "gps_valid",
     "gps_fix",
     "gps_source",
+    // The roll zero already subtracted from `lean_deg`. Add it back to recover
+    // the angle the mount calibration alone would have reported.
+    "lean_zero_deg",
 ];
 
 /// Render a value to a fixed number of decimals, or the empty string for a
@@ -97,6 +100,7 @@ pub fn write_csv_to<W: Write>(t: &Telemetry, w: &mut W) -> anyhow::Result<()> {
             (valid as u8).to_string(),
             fix.and_then(|f| f.fix).map(|v| v.to_string()).unwrap_or_default(),
             fix.map(|f| f.source.as_str()).unwrap_or("").to_string(),
+            cell(t.lean_zero.as_ref().map(|z| z.offset_deg[i]), 2),
         ] {
             row.push(',');
             row.push_str(&c);
@@ -319,6 +323,24 @@ pub fn summary(t: &Telemetry) -> String {
             .map(|r| format!(", r = {r:+.3} vs GPS course rate"))
             .unwrap_or_default(),
     ));
+    if let Some(g) = &t.grav_tilt {
+        s.push_str(&format!(
+            "gravity reference: GRAV sat {:.1}° off the accelerometer over {} coasting samples{}\n",
+            g.angle_deg,
+            g.samples,
+            if g.applied { ", corrected" } else { ", NOT corrected: too large to be a misalignment" },
+        ));
+    }
+    s.push_str(&match &t.lean_zero {
+        Some(z) => format!(
+            "lean zero: tracked over {} straight-line samples, {:+.1}°..{:+.1}° removed \
+             ({:.1}° of drift)\n",
+            z.samples, z.range_deg.0, z.range_deg.1, z.drift_deg(),
+        ),
+        None => "lean zero: not tracked (too little straight-line riding); lean rests on the \
+                 whole-file mount calibration alone\n"
+            .to_string(),
+    });
     s
 }
 
@@ -409,7 +431,13 @@ pub fn json_from_csv(
     } else {
         30.0
     };
-    let duration = times.last().copied().unwrap_or(0.0);
+    // A span, not the last timestamp: a clip cut out of a longer recording
+    // keeps the original GPMF timestamps, so its timeline starts wherever it
+    // was cut from and the last value is not its length.
+    let duration = match (times.first(), times.last()) {
+        (Some(a), Some(b)) => b - a,
+        _ => 0.0,
+    };
     let valid_count = rows
         .iter()
         .filter(|r| cell(r, i_valid) == Some("1"))

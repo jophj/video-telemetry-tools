@@ -17,7 +17,10 @@ pub struct Cli {
     pub command: Command,
 
     /// Print less. Warnings and errors still go to stderr.
-    #[arg(short, long, global = true)]
+    ///
+    /// Long-form only: `convert` documents `-q` as its `--quality` preset, and
+    /// a global short would claim that letter from every subcommand.
+    #[arg(long, global = true)]
     pub quiet: bool,
 }
 
@@ -81,6 +84,16 @@ pub struct ViewerArgs {
 pub struct ClipsArgs {
     /// GoPro .360 or .mp4 file.
     pub input: PathBuf,
+
+    /// Repair the camera's positions from an external GPS track before ranking.
+    ///
+    /// The same merge `gmax merge` performs, applied in place: the external
+    /// receiver's positions are substituted where the camera's own quality
+    /// metrics say its fixes are unsound, and the camera's IMU channels are
+    /// kept throughout. Without this a ride whose receiver struggled is ranked,
+    /// and cut, on positions it should not have trusted.
+    #[arg(long, value_name = "GPX")]
+    pub gps: Option<PathBuf>,
 
     /// Output directory. Defaults to <input stem>_highlights.
     #[arg(short, long)]
@@ -299,6 +312,14 @@ pub enum AccelArg {
 pub struct AnalyseArgs {
     /// A GoPro .360/.mp4, a telemetry CSV, or a GPX track.
     pub input: PathBuf,
+
+    /// Repair the camera's positions from an external GPS track before ranking.
+    ///
+    /// Only meaningful when the input is a video: it is the camera's own fixes
+    /// that are being replaced. See `gmax merge`, which does the same thing and
+    /// writes the merged track out instead of ranking it.
+    #[arg(long, value_name = "GPX")]
+    pub gps: Option<PathBuf>,
 
     /// Write the analysis as JSON instead of tables.
     #[arg(long)]

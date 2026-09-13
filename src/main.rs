@@ -30,32 +30,41 @@ fn run() -> Result<()> {
 
 fn cmd_viewer(args: &gmax::cli::ViewerArgs) -> Result<()> {
     // The viewer needs the telemetry as its own JSON. Three ways to get it, in
-    // order of preference: an explicit file, the video's own GPMF track, or a
-    // sibling CSV left by `gmax telemetry`.
+    // order of preference: an explicit file, a sibling CSV, or the video's own
+    // GPMF track.
+    //
+    // The sibling beats the embedded track deliberately. A file someone put
+    // there is a considered answer; a GPMF track is only raw sensor data, and
+    // on a clip cut out of a longer ride it is data that cannot be calibrated
+    // from what is in the clip — `gmax clips` leaves the ride's calibration
+    // beside each clip for exactly this reason. Which one was used is always
+    // announced, so preferring it is never silent.
     let json = if let Some(path) = &args.telemetry {
+        eprintln!("gmax: telemetry from {}", path.display());
         telemetry_json_from(path, args.max_dop, Some(&args.video))?
     } else {
-        match telemetry_json_from(&args.video, args.max_dop, Some(&args.video)) {
-            Ok(j) => j,
-            Err(video_err) => {
-                // A stitched proxy often has no telemetry of its own, so look
-                // for the CSV alongside it.
-                let stem = gmax::cli::with_extension(&args.video, "telemetry.csv");
-                let alt = strip_suffix_variant(&args.video);
-                let candidate = [Some(stem), alt]
-                    .into_iter()
-                    .flatten()
-                    .find(|p| p.exists());
-                match candidate {
-                    Some(p) => {
-                        eprintln!("gmax: using telemetry from {}", p.display());
-                        telemetry_json_from(&p, args.max_dop, Some(&args.video))?
-                    }
-                    None => return Err(video_err.context(
+        // A stitched proxy has no telemetry of its own and its stem carries a
+        // suffix the sibling's does not, so look under both spellings.
+        let sibling = [
+            Some(gmax::cli::with_extension(&args.video, "telemetry.csv")),
+            strip_suffix_variant(&args.video),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists());
+        match sibling {
+            Some(p) => {
+                eprintln!("gmax: telemetry from {}", p.display());
+                telemetry_json_from(&p, args.max_dop, Some(&args.video))?
+            }
+            None => {
+                eprintln!("gmax: telemetry from the track inside {}", args.video.display());
+                telemetry_json_from(&args.video, args.max_dop, Some(&args.video)).map_err(|e| {
+                    e.context(
                         "no telemetry found: pass --telemetry, or run `gmax telemetry` on the \
                          original .360 first",
-                    )),
-                }
+                    )
+                })?
             }
         }
     };
@@ -129,6 +138,47 @@ fn telemetry_json_from(
     Ok(String::from_utf8(out)?)
 }
 
+/// Where a clip's calibration sits: `<clip stem>.telemetry.csv`.
+///
+/// The name `gmax telemetry` already uses, and the one the viewer already
+/// looks for beside a stitched rendering — so one file serves both the `.360`
+/// clip and the `_equirect.mp4` made from it.
+fn clip_telemetry_path(clip: &std::path::Path) -> std::path::PathBuf {
+    gmax::cli::with_extension(clip, "telemetry.csv")
+}
+
+/// Write the parent ride's telemetry, sliced to one clip's own samples.
+///
+/// The range is taken from the cut file rather than from the planned window,
+/// because a stream copy starts at the keyframe at or before the requested
+/// instant and so runs a little long. The clip's GPMF keeps its parent's
+/// timestamps, which is what lets the two be matched exactly instead of
+/// approximately.
+fn write_clip_telemetry(
+    parent: &telemetry::Telemetry,
+    clip: &std::path::Path,
+    planned: &gmax::moments::clips::Clip,
+) -> Result<()> {
+    let (start, end) = match gmax::mp4::Mp4::open(clip)
+        .ok()
+        .and_then(|mut f| gmax::gpmf::from_mp4(&mut f).ok())
+        .and_then(|g| telemetry::timeline(&g))
+        .filter(|t| t.len() > 1)
+    {
+        Some(t) => (t[0], t[t.len() - 1]),
+        // No GPMF in the cut file, or timestamps that were not carried through:
+        // fall back to the window that was asked for. Off by up to a keyframe
+        // interval, which is better than nothing to calibrate against.
+        None => (planned.start_s, planned.end_s),
+    };
+    let (from, to) = parent.range_covering(start, end);
+    if to <= from {
+        anyhow::bail!("the clip's timeline does not overlap the source's");
+    }
+    telemetry::output::write_csv(&parent.slice(from, to), &clip_telemetry_path(clip))
+        .with_context(|| format!("writing {}", clip_telemetry_path(clip).display()))
+}
+
 fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     use gmax::ffmpeg::Ffmpeg;
     use gmax::moments::{self, clips, MetricId, Options};
@@ -158,7 +208,7 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
         .with_context(|| format!("reading {}", args.input.display()))?;
     let container_duration = file.duration_secs();
     let gpmf = gmax::gpmf::from_mp4(&mut file)?;
-    let t = telemetry::compute(
+    let mut t = telemetry::compute(
         &gpmf,
         &telemetry::Options {
             max_dop: args.max_dop,
@@ -167,6 +217,9 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     )?;
     for w in &t.warnings {
         eprintln!("gmax: warning: {w}");
+    }
+    if let Some(gpx) = &args.gps {
+        repair_positions(&mut t, gpx, quiet)?;
     }
 
     let samples = moments::samples_from_telemetry(&t);
@@ -274,6 +327,24 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
             println!("wrote {}", path.display());
         }
         written.push((c, path));
+    }
+
+    // Give each clip the ride's calibration, as a sibling the viewer prefers
+    // over the clip's own GPMF track.
+    //
+    // The track is still in there and still correct as raw sensor data, but
+    // nothing reading the clip alone can calibrate it: the roll zero needs
+    // straight-line riding and the gravity reference needs coasting, and a
+    // ten-second clip of one corner has neither. Left to itself a clip fits a
+    // mount from that one corner and reports a lean several degrees off the
+    // ride it was cut from -- which is exactly the disagreement that is
+    // confusing to run into and impossible to adjudicate from inside the clip.
+    for (c, path) in &written {
+        if let Err(e) = write_clip_telemetry(&t, path, c) {
+            eprintln!("gmax: warning: no telemetry written for {}: {e:#}", path.display());
+        } else if !quiet {
+            println!("wrote {}", clip_telemetry_path(path).display());
+        }
     }
 
     // A manifest, so the clips can be traced back to the moments that chose them.
@@ -532,6 +603,37 @@ fn cmd_encoders(args: &gmax::cli::EncodersArgs) -> Result<()> {
     Ok(())
 }
 
+/// Repair a telemetry's positions from an external GPS track, in place.
+///
+/// Shared by `analyse` and `clips`, which both rank a ride and must rank the
+/// same ride. The merge itself is `gmax merge`'s, at its defaults: this is the
+/// same operation, kept in memory instead of written out, so that the moments
+/// engine sees the repaired positions while still reading the camera's own IMU
+/// channels straight from the telemetry.
+fn repair_positions(t: &mut telemetry::Telemetry, gpx: &std::path::Path, quiet: bool) -> Result<()> {
+    use gmax::merge;
+
+    let external = gmax::gpx::read_file(gpx)
+        .with_context(|| format!("reading {}", gpx.display()))?;
+    if external.points.is_empty() {
+        anyhow::bail!("{} contains no track points", gpx.display());
+    }
+    let slots = merge::slots_from_telemetry(t);
+    if slots.is_empty() {
+        anyhow::bail!("this recording has no timestamped positions to align against");
+    }
+    let (merged, report) = merge::merge(&slots, &external, &merge::Options::default());
+    for w in &report.warnings {
+        eprintln!("gmax: warning: {w}");
+    }
+    let repaired = merge::apply_to_telemetry(t, &merged);
+    if !quiet {
+        print!("{}", report.summary());
+        println!("repaired {repaired} previously unusable fix(es) from {}", gpx.display());
+    }
+    Ok(())
+}
+
 fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
     use gmax::cli::AccelSourceArg;
     use gmax::moments::{self, clips, AccelSource, MetricId};
@@ -577,6 +679,14 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
     // to clamp against.
     let mut duration_s = None;
     let (samples, source, declared) = match ext.as_str() {
+        "gpx" | "csv" if args.gps.is_some() => {
+            anyhow::bail!(
+                "--gps repairs the camera's own fixes, so it needs the video. {} carries only \
+                 the positions that survived, with no record of where the receiver failed; \
+                 merge it with `gmax merge` instead.",
+                args.input.display()
+            )
+        }
         "gpx" => {
             let g = gmax::gpx::read_file(&args.input)
                 .with_context(|| format!("reading {}", args.input.display()))?;
@@ -597,7 +707,7 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
                 .with_context(|| format!("reading {}", args.input.display()))?;
             duration_s = Some(file.duration_secs());
             let gpmf = gmax::gpmf::from_mp4(&mut file)?;
-            let t = telemetry::compute(
+            let mut t = telemetry::compute(
                 &gpmf,
                 &telemetry::Options {
                     max_dop: args.max_dop,
@@ -606,6 +716,9 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
             )?;
             for w in &t.warnings {
                 eprintln!("gmax: warning: {w}");
+            }
+            if let Some(gpx) = &args.gps {
+                repair_positions(&mut t, gpx, quiet)?;
             }
             // No declared rate is offered here: the samples are at the
             // receiver's rate, and quoting the 30-per-payload IMU rate beside

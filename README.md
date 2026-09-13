@@ -137,6 +137,16 @@ a vehicle-frame IMU and so are camera-only.
 Works on a video, a telemetry CSV or any GPX — including a phone export, which
 is how it is checked against the reference implementation.
 
+`analyse` and `clips` both take `--gps <GPX>`, which runs the merge above in
+memory and writes the repaired positions back onto the camera's own fixes
+before ranking. That is not the same as ranking the merged GPX: a GPX carries
+lean angle and longitudinal acceleration and nothing else, so ranking one
+silently drops cornering and combined load, which have no GPX representation.
+Writing back keeps the external receiver's positions *and* the camera's full
+channel set. On a ride where the camera's receiver managed 79% usable fixes,
+it took every reported moment from 28-of-35 positioned to 35-of-35, and the
+measured distance from 15.3 km to 18.9 km.
+
 Sample cadence is **measured at runtime and never assumed**. Every window is
 expressed in seconds, every derivative divides by the actual interval between
 the two samples involved, and nothing uses a sample count as a proxy for
@@ -162,6 +172,37 @@ manifest records which moment chose each clip.
 A stream copy can only begin at a keyframe, so a clip starts at or before the
 requested instant and may run a little longer. Trimming to the frame would mean
 re-encoding.
+
+#### A clip cannot calibrate itself
+
+Each clip gets a sibling `<clip>.telemetry.csv` holding the *ride's* telemetry,
+sliced to that clip's own samples. The clip's embedded GPMF track is still
+there and still correct as raw sensor data — but nothing reading the clip alone
+can calibrate it. The roll zero needs straight-line riding and the gravity
+reference needs coasting, and ten seconds of one corner has neither, so a clip
+left to itself fits a mount from that one corner.
+
+The size of that: the 43° left-hander below reads **39.4°** from its own clip
+and **43.2°** from the ride, a 3.6° offset near-constant across all 330
+samples — the same curve with a different zero. The ride's is the right one,
+because the ride has straight-line riding to check it against and reads upright
+as zero throughout, while the clip's straight bit reads +3.3°.
+
+Timestamps in the sibling are re-based to start at zero, which is what a
+standalone file's timeline means. The viewer prefers a sibling over a video's
+embedded track for this reason, and always prints which one it used.
+
+Two bugs fell out of building it, both invisible on a whole recording and only
+visible on a clip, because a stream copy keeps the GPMF's *original*
+timestamps — an eighteen-minutes-in clip has a timeline starting at 1098 s, not
+at 0:
+
+- `t0` is anchored to `times[0]`, but absolute time was computed as
+  `t0 + times[i]`, double-counting the offset. Clip UTC was eighteen minutes
+  into the future.
+- The viewer read a CSV's duration as its last timestamp rather than its span,
+  so an eleven-second clip claimed to be eighteen minutes long and its whole
+  trace squeezed into the first percent of the scrubber.
 
 ### `viewer` — watch it back
 
@@ -273,6 +314,92 @@ mostly noise:
 
 An independent check falls out of `merge`: the phone's separately measured lean
 angle correlates *positively* with the camera's.
+
+#### The zero wanders
+
+Getting the sign right still leaves the question of where zero is. Lean is the
+angle between gravity and whichever direction the mount calls up, and that
+direction is fitted from the straight-line parts of the ride — where a machine
+held up by its own momentum must be upright.
+
+Fitted **once per file**, that zero is right on average and wrong nearly
+everywhere. On a 20-minute ride the reading a genuinely upright machine
+produces wandered across a 12° band, minute to minute, as the mount crept. A
+corner is then reported at whatever end of the band it fell in. One 43°
+left-hander sat in a −6° pocket and was indexed, cut and filed as 49° — five
+degrees clear of a field it should have tied with. The same corner cut out into
+its own clip read 39°, because the clip re-fitted the zero from its own
+11 seconds.
+
+So the fit is made again locally: the median lean over the upright samples
+within 30 s of each instant, subtracted from the angle. Upright riding then
+reads zero *wherever* it occurs rather than on average, a cut clip agrees with
+the ride it came from, and the whole-ride residual against an external
+reference — `atan(v·ω/g)` from GPS speed and course rate — falls from a
+drifting −6°..+5° to a flat −2.8°..+1.6°. The offset removed is kept, in the
+`lean_zero_deg` CSV column and in `Telemetry::lean_zero`, so the raw angle can
+always be recovered.
+
+A source with too little straight-line riding to fit against — a short clip cut
+out of a single corner — gets no correction and a warning saying so. Fitting a
+zero to one corner would be worse than not fitting one.
+
+#### GRAV is not vertical
+
+Getting the zero right exposed the next thing. `GRAV` is the camera's *fused
+estimate* of which way is down, not a measurement, and it is wrong.
+
+Where the machine is rolling straight, upright, and neither braking nor
+driving, the only force acting on it is gravity — so the accelerometer, which
+measures force, **is** the vertical. On the reference ride `GRAV` sits a median
+8° off it, steadily, from one end of the recording to the other (5.7° taken as
+a single rotation; 8.4° on the next recording).
+
+What that costs depends on how a channel uses `GRAV`. Lean and pitch are angles
+against a reference fitted from `GRAV` itself, so a fixed tilt cancels: both
+sides turn together, and correcting it moves lean by a median 0.05°. The
+road-frame acceleration channels have no such reference — they resolve force
+against `GRAV` directly — so the tilt lands in them whole. A machine riding
+dead straight reported **0.09 g across itself**, 5° of cornering load that was
+not there.
+
+So `GRAV` is put back on the accelerometer's vertical before anything reads it:
+the rotation taking one onto the other, measured as a component-wise median
+over the coasting samples, applied to the whole stream. Straight-line lateral
+load falls from 0.092 g to 0.012 g, and total acceleration — a magnitude, which
+owes nothing to any frame — comes through bit-identical, which is the check
+that the correction is a rotation and nothing more.
+
+Unlike the roll zero this is *not* tracked over time, and not because it was
+easier. The roll zero describes where the camera sits on the machine, which a
+slipping mount changes. This describes how two sensors inside one camera
+disagree, which no amount of mount movement can affect — so the whole recording
+is one measurement of it.
+
+The two faults were also pulling in opposite directions, which is what made the
+lean channel look worse than it was. Comparing lean against the *uncorrected*
+lateral load showed a 10° left/right asymmetry and suggested lean was
+over-reading on left-handers. It was not: the asymmetry was in the ruler. With
+both corrections in, lean exceeds the load it is measured against by 2.9° on
+left turns and 0.2° on right — small, positive, and about the size of the
+contact-patch offset that should be there.
+
+#### Checking lean against something that is not lean
+
+Lean is an angle against a calibrated idea of upright. Lateral g is a force
+measured against gravity, in the gravity frame, and owes that calibration
+nothing. So every reported lean peak is checked against the lateral
+acceleration at the same instant, and flagged when the two disagree by more
+than 8°.
+
+The tolerance is not tight, and deliberately: a real corner leans a few degrees
+further than `atan(a_lat / g)` because the contact patch sits inboard of the
+tyre's centreline. What it catches is the gross case — a peak whose angle no
+measured load supports, which is what a mis-placed zero or a tilted vertical
+looks like from the outside. It earned its keep immediately: it was this check
+firing on four of ten lean peaks, after the roll zero was already fixed, that
+turned up the `GRAV` tilt above. With both corrections in it is silent on the
+reference footage.
 
 ### Levelling
 
