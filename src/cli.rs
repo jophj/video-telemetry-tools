@@ -463,8 +463,8 @@ pub struct MergeArgs {
     #[arg(long, default_value_t = 30.0, value_name = "S")]
     pub align_span: f64,
 
-    /// Reject a substitution whose bracketing external points are further away
-    /// than this in time.
+    /// Interpolate across samples up to this far apart (or 2.5 of the source's
+    /// own intervals, if longer); otherwise use the nearest within this.
     #[arg(long, default_value_t = 1.0, value_name = "S")]
     pub max_dt: f64,
 
