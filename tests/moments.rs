@@ -131,7 +131,7 @@ fn results_are_the_same_at_every_cadence() {
         let accel = a.metrics.iter().find(|m| m.id == MetricId::Accel).unwrap();
         let p = accel.entries[0].value;
         assert!(
-            (p - 1.5708).abs() < 0.05,
+            (p - 10.0 * std::f64::consts::TAU / 40.0).abs() < 0.05,
             "at {hz} Hz peak acceleration was {p}"
         );
         peak_accels.push(p);
@@ -588,4 +588,89 @@ fn a_hand_cut_clip_is_named_by_its_window() {
     assert_eq!(c.name("GS010527"), "GS010527_cut_t0300_8p5s");
     let c = clips::manual(12.0, Some(30.0), &opts).unwrap();
     assert_eq!(c.name("GS010527"), "GS010527_cut_t0012_30s");
+}
+
+#[test]
+fn a_curvy_window_is_clipped_from_its_start_not_from_its_hardest_corner() {
+    use gmax::moments::clips::{self, PlanOptions};
+    // Three corners in ten seconds, the hardest last: 20, 25 and 40 degrees,
+    // peaking at 100, 104 and 108 s. The window is 100-110 s, so its clip must
+    // run from the run-in before 100 s to the run-out after 110 s. Anchoring it
+    // on the hardest corner cut 102-122 s instead: most of the corners the
+    // window was chosen for, missed.
+    let t0 = 1_788_601_214.0f64;
+    let peaks = [(100.0, 20.0), (104.0, -25.0), (108.0, 40.0)];
+    let samples: Vec<Sample> = (0..2000)
+        .map(|i| {
+            let t = i as f64 / 10.0;
+            let lean = peaks
+                .iter()
+                .map(|&(at, peak)| peak * (-((t - at) / 0.8).powi(2)).exp())
+                .sum::<f64>();
+            Sample {
+                t: t0 + t,
+                lean_deg: Some(lean),
+                video_time_s: Some(t),
+                ..Default::default()
+            }
+        })
+        .collect();
+    let a = moments::analyse(
+        &samples,
+        &Options {
+            metrics: vec![MetricId::Curves],
+            top: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let entry = &a.metrics[0].entries[0];
+    assert_eq!(entry.curve_count, Some(3));
+    assert_eq!(entry.video_time_s, Some(100.0), "the window starts at its first corner");
+    let peak = entry.peak_lean_deg.unwrap();
+    assert!((peak - 40.0).abs() < 1e-6, "the hardest corner is kept for the label: {peak}");
+
+    let opts = PlanOptions {
+        duration_s: Some(200.0),
+        ..Default::default()
+    };
+    let (clips, _) = clips::plan(&a, &opts);
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].start_s, 100.0 - opts.pre_s);
+    assert_eq!(clips[0].end_s, 110.0 + opts.post_s);
+}
+
+#[test]
+fn a_telemetry_csv_from_a_cut_clip_gives_video_times_into_the_clip() {
+    // `gmax telemetry` on a stream-copied clip writes the GPMF's own
+    // timestamps, which start wherever the clip was cut from. A moment's video
+    // time is a position in *this* file, so it is measured from the first row.
+    let csv = "\
+time_s,utc,lat,lon,speed_kmh,lean_deg
+1098.060,2026-09-08T11:25:05.100Z,44.1,11.3,60,5
+1098.160,2026-09-08T11:25:05.200Z,44.1,11.3,60,10
+1098.260,2026-09-08T11:25:05.300Z,,,,20
+";
+    let s = moments::samples_from_csv(csv).unwrap();
+    let v: Vec<f64> = s.iter().map(|s| s.video_time_s.unwrap()).collect();
+    assert!((v[0]).abs() < 1e-9 && (v[2] - 0.2).abs() < 1e-9, "video times {v:?}");
+    // The clock is untouched.
+    assert!((s[0].t - 1_788_866_705.1).abs() < 1e-3, "t {}", s[0].t);
+}
+
+#[test]
+fn a_telemetry_csv_with_no_clock_is_timed_from_its_first_row() {
+    // A recording with no GPS time writes blank utc cells. Every row used to be
+    // dropped for it, and with them the lean the file still carried.
+    let csv = "\
+time_s,utc,lat,lon,speed_kmh,lean_deg
+0.060,,,,,5
+0.160,,,,,30
+0.260,,,,,10
+";
+    let s = moments::samples_from_csv(csv).unwrap();
+    assert_eq!(s.len(), 3);
+    assert!((s[1].t - 0.1).abs() < 1e-9);
+    let a = moments::analyse(&s, &Options::default()).unwrap();
+    assert!(!a.has_absolute_clock());
 }

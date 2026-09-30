@@ -90,7 +90,8 @@ pub fn write_csv_to<W: Write>(t: &Telemetry, w: &mut W) -> anyhow::Result<()> {
             channel(&t.lean_rate_dps, i, 1),
             format!("{:.2}", t.pitch_deg[i]),
             channel(&t.pitch_rate_dps, i, 1),
-            format!("{:.1}", t.yaw_rate_dps[i]),
+            // Blank rather than `NaN` for a source with no gyro.
+            cell(Some(t.yaw_rate_dps[i]), 1),
             channel(&t.accel_lon_g, i, 3),
             channel(&t.accel_lat_g, i, 3),
             channel(&t.accel_vert_g, i, 3),
@@ -186,8 +187,9 @@ pub fn write_json_to<W: Write>(
     write!(w, ",\"gps_fix_pct\":{:.1}", t.fix_percentage())?;
     write!(
         w,
-        ",\"lean_sign\":{{\"flipped\":{},\"correlation\":{:.4},\"gps_correlation\":{},\"samples\":{},\"confidence\":{}}}",
+        ",\"lean_sign\":{{\"flipped\":{},\"turn_rate_inverted\":{},\"correlation\":{:.4},\"gps_correlation\":{},\"samples\":{},\"confidence\":{}}}",
         t.lean_sign.flipped,
+        t.lean_sign.turn_rate_inverted,
         t.lean_sign.correlation,
         t.lean_sign
             .gps_correlation
@@ -323,6 +325,11 @@ pub fn summary(t: &Telemetry) -> String {
             .map(|r| format!(", r = {r:+.3} vs GPS course rate"))
             .unwrap_or_default(),
     ));
+    if t.lean_sign.turn_rate_inverted {
+        s.push_str(
+            "turn rate: backwards on this camera by GPS, so yaw rate has been negated\n",
+        );
+    }
     if let Some(g) = &t.grav_tilt {
         s.push_str(&format!(
             "gravity reference: GRAV sat {:.1}° off the accelerometer over {} coasting samples{}\n",

@@ -35,8 +35,23 @@ const DOP_SENTINEL: f64 = 99.98;
 /// way the vehicle considers up.
 const UPRIGHT_MIN_SPEED_MS: f64 = 5.0;
 
-/// ...and below this rate of turn, in degrees per second.
-const UPRIGHT_MAX_TURN_DPS: f64 = 2.0;
+/// ...and carrying no more cornering load than a machine leaned this far, in
+/// degrees.
+///
+/// The load a turn puts on the machine is speed times rate of turn, and it is
+/// the load, not the rate, that sets how far a machine leans. A cap on the rate
+/// alone admits a different lean at every speed: 2°/s is half a degree of lean
+/// at walking pace but seven at 130 km/h, which is a motorway sweeper, not a
+/// straight. Capping the load instead admits the same lean at every speed. See
+/// [`upright_samples`].
+///
+/// Measured on the reference ride, where the old 2°/s cap let enough fast
+/// sweepers into the set to widen the roll zero's apparent drift from 9.0° to
+/// 10°. It is not tighter because the set also has to be dense enough to fit a
+/// zero locally: at 1.5° a minute of hairpins on the same ride lost so much of
+/// its reference that the fit fell back to a window three times as wide, and
+/// upright riding there read 3.7° off zero.
+const UPRIGHT_MAX_LEAN_DEG: f64 = 2.0;
 
 /// Half-width of the window each roll-zero point is taken over, in seconds.
 ///
@@ -50,8 +65,8 @@ const ROLL_ZERO_WIDE_HALF_WINDOW_S: f64 = 90.0;
 /// Upright samples one baseline point needs before the narrow window is used.
 const ROLL_ZERO_MIN_LOCAL: usize = 40;
 
-/// Upright samples a baseline point needs before it is preferred to the
-/// whole-file median.
+/// Upright samples a baseline point needs to be measured at all. One with
+/// fewer is filled in from the measured points either side of it.
 const ROLL_ZERO_MIN_WIDE: usize = 10;
 
 /// Upright samples the file needs before the roll zero is tracked at all.
@@ -81,6 +96,17 @@ const COAST_MAX_ACCEL_MS2: f64 = 0.3;
 /// Coasting samples needed before the gravity reference is trusted.
 const GRAV_TILT_MIN_SAMPLES: usize = 200;
 
+/// The cornering load the gravity reference admits, as a lean in degrees.
+///
+/// Looser than [`UPRIGHT_MAX_LEAN_DEG`] because the two fits fail differently.
+/// The roll zero is local: one sweeper can fill a whole thirty-second window
+/// and drag it. The gravity fit is one median over the entire ride, where
+/// sweepers left and right cancel, and it is already cut down to the coasting
+/// samples -- so what it most needs is more of them. On the reference ride a
+/// 1.5° gate left it 559 samples and 0.011 g of lateral bias on straights
+/// judged by GPS course alone; this one gives it 987 and 0.002 g.
+const COAST_MAX_LEAN_DEG: f64 = 3.0;
+
 /// A `GRAV`-to-accelerometer disagreement beyond this, in degrees, is not a
 /// sensor misalignment but a sign that one of the two streams is not what this
 /// code thinks it is. It is reported and not applied.
@@ -88,6 +114,17 @@ const GRAV_TILT_MAX_DEG: f64 = 30.0;
 
 /// A tilt worth mentioning in the quality report, in degrees.
 const GRAV_TILT_WARN_DEG: f64 = 2.0;
+
+/// Rate of turn above which a corner is well enough defined to say how fast
+/// the machine must be going, in degrees per second. See
+/// [`flag_speed_against_imu`].
+const IMU_SPEED_MIN_TURN_DPS: f64 = 15.0;
+
+/// ...and lateral load above which it is, in g.
+const IMU_SPEED_MIN_LATERAL_G: f64 = 0.1;
+
+/// Half-width of the window the IMU's speed is taken over, in seconds.
+const IMU_SPEED_HALF_WINDOW_S: f64 = 0.5;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -122,6 +159,26 @@ pub struct Options {
     /// Allowance added to the speed limit above, in m/s, so that ordinary
     /// receiver noise between adjacent fixes is not mistaken for a jump.
     pub speed_floor_ms: f64,
+    /// Reject a fix whose speed implies this much acceleration against the
+    /// valid fixes either side of it, in m/s². Zero disables the check. See
+    /// [`flag_speed_jumps`].
+    ///
+    /// About 1.5 g, the same ceiling the moments engine puts on acceleration:
+    /// no road machine gets near it, so a speed step that implies it is the
+    /// receiver's, not the bike's.
+    pub max_speed_accel_ms2: f64,
+    /// Reject a fix whose speed is off by more than this factor, either way,
+    /// from the speed the IMU says a corner is being taken at. Zero disables
+    /// the check.
+    ///
+    /// The position check above cannot see a receiver whose speed and position
+    /// are wrong *together*, and nor can a jump check see one that is wrong
+    /// smoothly. On the reference clip both happen as the receiver reacquires
+    /// in a hairpin: it reports 8 km/h, sliding smoothly down from 15 and back
+    /// up to 30, through a 41° corner taken at 45°/s -- which is only possible
+    /// at around 30 km/h. That fix then headed the lean ranking at "11.3
+    /// km/h". See [`flag_speed_against_imu`].
+    pub max_imu_speed_ratio: f64,
     /// Put `GRAV` back on the vertical the accelerometer measures before
     /// deriving anything from it. See [`GravTilt`].
     ///
@@ -140,6 +197,8 @@ impl Default for Options {
             accel_window_s: 0.2,
             max_speed_ratio: 2.0,
             speed_floor_ms: 10.0,
+            max_speed_accel_ms2: 15.0,
+            max_imu_speed_ratio: 2.5,
             correct_grav: true,
         }
     }
@@ -176,6 +235,9 @@ pub enum Reject {
     NullIsland,
     Frozen,
     Implausible,
+    /// The speed itself is physically impossible: it jumps further than a
+    /// machine can accelerate, or disagrees with the corner the IMU measured.
+    ImplausibleSpeed,
 }
 
 impl Reject {
@@ -186,6 +248,7 @@ impl Reject {
             Reject::NullIsland => "position is exactly 0,0",
             Reject::Frozen => "position frozen after loss of lock",
             Reject::Implausible => "position inconsistent with the receiver's own speed",
+            Reject::ImplausibleSpeed => "speed inconsistent with the machine's own motion",
         }
     }
 }
@@ -221,6 +284,14 @@ pub struct LeanSign {
     /// Paired samples the decision rested on.
     pub samples: usize,
     pub flipped: bool,
+    /// True when GPS showed the gyro's rate of turn to run the opposite way to
+    /// the one assumed, so `yaw_rate_dps` has been negated to stay positive to
+    /// the right.
+    ///
+    /// Lean is signed against the corrected turn rate and so is right either
+    /// way; this records that the reported yaw rate was corrected too, rather
+    /// than left reporting a right-hand turn as a left-hand one.
+    pub turn_rate_inverted: bool,
     pub confidence: Confidence,
 }
 
@@ -230,8 +301,18 @@ pub struct LeanSign {
 /// measurement, and on this camera it is several degrees out. Where the
 /// machine is rolling straight and neither braking nor driving, the only force
 /// acting on it is gravity — so the accelerometer, which measures force, **is**
-/// the vertical. On the reference ride the two disagree by a median 8°,
-/// steadily, from one end of the recording to the other.
+/// the vertical. On the reference ride the two disagree by 4.8°, steadily, from
+/// one end of the recording to the other.
+///
+/// That figure is the rotation fitted over the ride's 987 coasting samples: the
+/// component-wise median of the per-sample rotation vectors taking `GRAV` onto
+/// the accelerometer, which is the correction actually applied. It is *not*
+/// the median of the per-sample angles, which is 6.4° over the same samples
+/// and is the wrong number to quote: an angle is a magnitude, so the vibration
+/// a motorcycle puts through its accelerometer adds to every sample's angle
+/// whichever way it points, where in the rotation vectors it points every way
+/// and cancels. (An earlier version of this note quoted 8°, which was that
+/// mistake.)
 ///
 /// It matters because of *which* channels trust `GRAV` absolutely. Lean and
 /// pitch are angles against a reference fitted from `GRAV` itself, so a fixed
@@ -328,14 +409,25 @@ pub struct Telemetry {
     pub times: Vec<f64>,
     /// Absolute time of the first master sample, from GPS where available.
     pub t0: Option<DateTime<Utc>>,
-    /// True when `t0` came from the container clock rather than from GPS.
+    /// True when `t0` came from some clock other than GPS, such as the
+    /// container's.
+    ///
+    /// [`compute`] only ever anchors to GPS, so it leaves this false --
+    /// including when there is no GPS clock and `t0` is `None`. An absent clock
+    /// is not a fallback one, and saying otherwise told readers of the JSON
+    /// that a start time they were not given was approximate.
     pub t0_is_fallback: bool,
     pub duration_s: f64,
 
     pub lean_deg: Vec<f64>,
+    /// Degrees, positive nose-up.
     pub pitch_deg: Vec<f64>,
+    /// Degrees per second, positive turning right. NaN throughout when the
+    /// source has no `GYRO`, since a rate that was never measured is not zero.
     pub yaw_rate_dps: Vec<f64>,
     pub lean_rate_dps: Option<Vec<f64>>,
+    /// Degrees per second, positive nose-up: the rate `pitch_deg` changes at,
+    /// measured by the gyro rather than differenced from the angle.
     pub pitch_rate_dps: Option<Vec<f64>>,
     pub accel_lon_g: Option<Vec<f64>>,
     pub accel_lat_g: Option<Vec<f64>>,
@@ -398,11 +490,18 @@ impl Telemetry {
         // The fixes landing inside the slice, re-based onto its clock. The
         // bound is the end of the *last sample*, not the start, or a fix in the
         // final sample period would be dropped.
+        //
+        // Plus the one fix taken before the slice began, if there is one: it
+        // is the fix still in effect over the slice's first samples, so it is
+        // what they must report. Without it they had no fix at all, and the
+        // index then handed them the first fix *after* them instead -- a
+        // position the bike had not reached yet. It keeps its true time, which
+        // on the slice's clock is negative.
         let span_end = self.times.get(to.saturating_sub(1)).copied().unwrap_or(origin);
-        let gps: Vec<GpsFix> = self
-            .gps
+        let first_inside = self.gps.partition_point(|f| f.time < origin);
+        let gps: Vec<GpsFix> = self.gps[first_inside.saturating_sub(1)..]
             .iter()
-            .filter(|f| f.time >= origin && f.time <= span_end)
+            .filter(|f| f.time <= span_end)
             .map(|f| GpsFix { time: f.time - origin, ..f.clone() })
             .collect();
         let times: Vec<f64> = self.times[from..to].iter().map(|t| t - origin).collect();
@@ -460,10 +559,28 @@ impl Telemetry {
     /// timestamps, so an eighteen-minutes-in clip has a timeline starting at
     /// 1098 s, and treating that as an offset from `t0` put its UTC eighteen
     /// minutes into the future.
+    ///
+    /// `None` without a clock, and on an empty slice, which has no first sample
+    /// to measure from.
     pub fn utc_of(&self, time_s: f64) -> Option<DateTime<Utc>> {
         let t0 = self.t0?;
-        let micros = ((time_s - self.times[0]) * 1e6).round() as i64;
+        let micros = ((time_s - self.times.first()?) * 1e6).round() as i64;
         Some(t0 + chrono::Duration::microseconds(micros))
+    }
+
+    /// Seconds into the video at a point on this source's own timeline.
+    ///
+    /// Measured from `times[0]` for the same reason [`utc_of`](Self::utc_of)
+    /// is: a clip cut out of a longer recording keeps the GPMF's original
+    /// timestamps, so its timeline starts wherever it was cut from while its
+    /// video starts at zero. Reading the raw timestamp as a video position put
+    /// every moment of an eighteen-minutes-in clip past the end of the file.
+    ///
+    /// On a whole recording this reads a frame or two early, since the first
+    /// sample lands 60 ms in on the reference clip. That is well inside a
+    /// clip's run-in, and the price of one rule that is right for both.
+    pub fn video_time_of(&self, time_s: f64) -> Option<f64> {
+        Some(time_s - self.times.first()?)
     }
 
     /// Absolute time of master sample `i`.
@@ -685,49 +802,51 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
             .map(|f| f.speed_2d)
     };
 
+    // Which samples are rolling upright, and what the speed is doing. Both are
+    // gates for the calibration below, and both have to be able to say "not
+    // known": a source with no gyro cannot tell a straight from a corner, and
+    // a speed change across a dropout was not measured. Treating either as
+    // zero let corners into the straight-line set and braking into the
+    // coasting one.
+    let provisional = turn_rate_series(gyro.as_deref(), &grav, n);
+    let dv = speed_derivative(&times, &speed_at, n, hz);
+    if gyro.is_none() {
+        warnings.push(
+            "no GYRO stream, so straight-line riding cannot be told from cornering: GRAV has not \
+             been checked against the accelerometer, and the roll zero is not tracked. Lean \
+             rests on a single whole-file mount calibration."
+                .into(),
+        );
+    }
+
     // --- gravity reference -------------------------------------------------
     // Put `GRAV` back on the vertical the accelerometer measures, before
     // anything uses it. See [`GravTilt`]: this has to happen here, ahead of the
     // mount calibration, because the tilt is in the channel every later step
     // reads — and the acceleration channels, which resolve force against
     // `GRAV` with nothing to cancel against, inherit the whole of it.
-    let grav_tilt = match accel.as_deref().filter(|_| opts.correct_grav) {
-        None => None,
-        Some(acc) => {
-            let dv = speed_derivative(&times, &speed_at, n, hz);
-            let provisional = turn_rate_series(gyro.as_deref(), &grav, n);
-            let rotations: Vec<Vec3> = (0..n)
-                .filter(|&i| {
-                    speed_at(i).unwrap_or(0.0) > UPRIGHT_MIN_SPEED_MS
-                        && provisional[i].to_degrees().abs() < UPRIGHT_MAX_TURN_DPS
-                        && dv[i].abs() < COAST_MAX_ACCEL_MS2
-                })
-                // Rolling straight and neither braking nor driving: the only
-                // force here is gravity, so the accelerometer points along the
-                // true vertical and this cross product is the rotation that
-                // takes `GRAV` onto it.
-                .map(|i| cross(&grav[i], &normalize(&acc[i])))
+    let grav_tilt = match (accel.as_deref().filter(|_| opts.correct_grav), &provisional) {
+        (Some(acc), Some(turn)) => {
+            // Rolling straight and neither braking nor driving: the only force
+            // here is gravity, so the accelerometer points along the true
+            // vertical.
+            let coasting: Vec<usize> = upright_samples(&speed_at, turn, n, COAST_MAX_LEAN_DEG)
+                .into_iter()
+                .filter(|&i| dv[i].is_some_and(|a| a.abs() < COAST_MAX_ACCEL_MS2))
                 .collect();
-            (rotations.len() >= GRAV_TILT_MIN_SAMPLES).then(|| {
-                let r = median_vec(&rotations);
-                let angle = magnitude(&r).clamp(-1.0, 1.0).asin();
-                let applied = angle.to_degrees() <= GRAV_TILT_MAX_DEG;
-                let axis = normalize(&r);
-                if applied {
-                    for g in grav.iter_mut() {
-                        *g = normalize(&rotate_about(g, &axis, angle));
-                    }
+            let tilt = fit_grav_tilt(&grav, acc, &coasting);
+            if let Some(t) = tilt.as_ref().filter(|t| t.applied) {
+                for g in grav.iter_mut() {
+                    *g = normalize(&rotate_about(g, &t.axis, t.angle_deg.to_radians()));
                 }
-                GravTilt {
-                    angle_deg: angle.to_degrees(),
-                    axis,
-                    samples: rotations.len(),
-                    applied,
-                }
-            })
+            }
+            tilt
         }
+        _ => None,
     };
     match &grav_tilt {
+        // Without a gyro the reason has already been given, and more fully.
+        None if gyro.is_none() || !opts.correct_grav || accel.is_none() => {}
         None => warnings.push(
             "no coasting, straight-line riding in this source, so GRAV could not be checked \
              against the accelerometer. The road-frame acceleration channels rest on the \
@@ -754,12 +873,10 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
     // straight-line samples only, where gravity really is the vehicle's "up".
     let (mut up_ref, mut lat_ax) = calibrate_mount(&grav, None);
     let mut yaw = turn_rate_series(gyro.as_deref(), &grav, n);
-    let straight: Vec<usize> = (0..n)
-        .filter(|&i| {
-            speed_at(i).unwrap_or(0.0) > UPRIGHT_MIN_SPEED_MS
-                && yaw[i].to_degrees().abs() < UPRIGHT_MAX_TURN_DPS
-        })
-        .collect();
+    let straight: Vec<usize> = match &yaw {
+        Some(turn) => upright_samples(&speed_at, turn, n, UPRIGHT_MAX_LEAN_DEG),
+        None => Vec::new(),
+    };
     if straight.len() > 30.max((0.02 * n as f64) as usize) {
         let (u, l) = calibrate_mount(&grav, Some(&straight));
         up_ref = u;
@@ -775,8 +892,13 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
         .collect();
     lean = moving_average(&lean, 5);
 
-    // `yaw` is in rad/s here and is the rightward turn-rate reference.
-    let turn_rate_dps: Vec<f64> = yaw.iter().map(|v| v.to_degrees()).collect();
+    // `yaw` is in rad/s here and is the rightward turn-rate reference. With no
+    // gyro there is no reference, and zeros stand in for it: they correlate
+    // with nothing, so the sign is reported as unconfirmed rather than guessed.
+    let turn_rate_dps: Vec<f64> = match &yaw {
+        Some(y) => y.iter().map(|v| v.to_degrees()).collect(),
+        None => vec![0.0; n],
+    };
     let lean_sign = resolve_lean_sign(&lean, &turn_rate_dps, &gps, &gps_index, &speed_at);
     if lean_sign.flipped {
         for v in lean.iter_mut() {
@@ -785,6 +907,10 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
         lat_ax = scale(&lat_ax, -1.0);
         fwd = normalize(&cross(&lat_ax, &up_ref));
     }
+    // Yaw rate is the reference itself, so if GPS showed its sense to be
+    // backwards the reported channel is backwards too, not just the copy lean
+    // was signed against. (Pitch rate settles its own sign; see below.)
+    let gyro_sign = if lean_sign.turn_rate_inverted { -1.0 } else { 1.0 };
     if lean_sign.confidence != Confidence::High {
         warnings.push(format!(
             "lean sign confidence is {}: |r| = {:.3} against turn rate over {} samples, and the \
@@ -833,6 +959,8 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
             }
             Some(zero)
         }
+        // Already explained, and more precisely, by the missing-gyro warning.
+        None if gyro.is_none() => None,
         None => {
             warnings.push(format!(
                 "only {} straight-line sample(s) here, too few to track the roll zero: lean is \
@@ -849,18 +977,21 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
     // Which end of the lateral axis is "right" is settled; which end of the
     // forward axis is "ahead" is not. Resolve it against GPS speed change:
     // accelerating forwards must read as positive longitudinal acceleration.
+    // A speed change that was not measured says nothing either way.
     if let Some(acc) = accel.as_deref() {
-        let dv = speed_derivative(&times, &speed_at, n, hz);
+        let known: Vec<usize> = (0..n).filter(|&i| dv[i].is_some()).collect();
         let lon_for = |f: &Vec3| -> Vec<f64> {
-            (0..n)
-                .map(|i| {
+            known
+                .iter()
+                .map(|&i| {
                     let fh = normalize(&reject(f, &grav[i]));
                     let ah = reject(&acc[i], &grav[i]);
                     dot(&ah, &fh)
                 })
                 .collect()
         };
-        if correlation_sign(&lon_for(&fwd), &dv) < 0.0 {
+        let dv_known: Vec<f64> = known.iter().filter_map(|&i| dv[i]).collect();
+        if correlation_sign(&lon_for(&fwd), &dv_known) < 0.0 {
             fwd = scale(&fwd, -1.0);
         }
     }
@@ -873,20 +1004,34 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
                 (0..n).map(|i| dot(&gy[i], &fwd).to_degrees()).collect();
             // A roll rate must agree with the derivative of the roll angle it
             // is supposed to describe.
-            let mut dlean = vec![0.0; n];
-            for i in 1..n.saturating_sub(1) {
-                let dt = times[i + 1] - times[i - 1];
-                if dt > 0.0 {
-                    dlean[i] = (lean[i + 1] - lean[i - 1]) / dt;
-                }
-            }
+            let dlean = central_difference(&lean, &times);
             if correlation_sign(&roll_rate, &dlean) < 0.0 {
                 for v in roll_rate.iter_mut() {
                     *v = -*v;
                 }
             }
-            let pitch_rate: Vec<f64> =
-                (0..n).map(|i| dot(&gy[i], &lat_ax).to_degrees()).collect();
+            // Pitch rate is read from the same axes as pitch itself. Pitch is
+            // `asin(fwd · g)`, and a world-fixed vector seen from a frame
+            // turning at ω moves as `dg/dt = -ω × g`, so
+            //
+            //     d(fwd · g)/dt = fwd · (-ω × g) = ω · (fwd × g).
+            //
+            // Rotation about `g` itself -- the rate of turn -- drops out, so
+            // this is the rate the pitch angle changes at, not a body rate
+            // that reads nose-up all through a banked corner. The one thing
+            // it needs is the sense of that cross product, which depends on
+            // the frame's handedness and the gyro's sign convention, neither
+            // of which the camera states; see [`gyro_handedness`]. Reading
+            // the rate about the lateral axis instead, as this once did,
+            // came out positive nose-*down* on the reference clip, opposite
+            // to the angle it sits beside.
+            let h = gyro_handedness(gy, &grav, &times);
+            let pitch_rate: Vec<f64> = (0..n)
+                .map(|i| {
+                    let cos_pitch = (1.0 - dot(&fwd, &grav[i]).powi(2)).sqrt().max(1e-6);
+                    h * dot(&gy[i], &cross(&fwd, &grav[i])).to_degrees() / cos_pitch
+                })
+                .collect();
             (Some(roll_rate), Some(pitch_rate))
         }
     };
@@ -899,16 +1044,15 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
             let mut lat = Vec::with_capacity(n);
             let mut vert = Vec::with_capacity(n);
             let mut tot = Vec::with_capacity(n);
-            for i in 0..n {
-                let up = grav[i];
-                let av = dot(&acc[i], &up);
-                let ah = reject(&acc[i], &up);
-                let fh = normalize(&reject(&fwd, &up));
-                let left = cross(&up, &fh);
+            for (a, up) in acc.iter().zip(&grav) {
+                let av = dot(a, up);
+                let ah = reject(a, up);
+                let fh = normalize(&reject(&fwd, up));
+                let left = cross(up, &fh);
                 lon.push(dot(&ah, &fh) / G);
                 lat.push(-dot(&ah, &left) / G); // positive to the right
                 vert.push((av - G) / G); // zero at rest
-                tot.push(magnitude(&acc[i]) / G); // one at rest
+                tot.push(magnitude(a) / G); // one at rest
             }
             // Lateral acceleration and lean are two views of the same corner.
             if correlation_sign(&lat, &lean) < 0.0 {
@@ -942,15 +1086,36 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
                 .collect()
         });
 
-    // --- absolute clock ----------------------------------------------------
-    let (t0, t0_is_fallback) = match gps.iter().find(|f| f.valid && f.utc.is_some()) {
-        Some(f) => {
-            let anchor = f.utc.unwrap();
-            let offset = chrono::Duration::microseconds(((f.time - times[0]) * 1e6).round() as i64);
-            (Some(anchor - offset), false)
-        }
-        None => (None, true),
+    // `yaw` in degrees per second, positive right whatever the gyro's own
+    // handedness; NaN, not zero, where there was no gyro to measure it.
+    let yaw_rate_dps: Vec<f64> = match &yaw {
+        Some(y) => y.iter().map(|v| gyro_sign * v.to_degrees()).collect(),
+        None => vec![f64::NAN; n],
     };
+
+    // --- speed against the IMU ---------------------------------------------
+    // Last, because it needs the finished lateral channel. The calibration
+    // above used GPS speed only as a gate, where a fix this check rejects does
+    // little harm; the channels a reader sees are what it protects.
+    if let (Some(alat), true) = (a_lat.as_deref(), gyro.is_some()) {
+        let rejected = flag_speed_against_imu(
+            &mut gps,
+            &times,
+            &yaw_rate_dps,
+            alat,
+            opts.max_imu_speed_ratio,
+        );
+        if rejected > 0 {
+            // Course was derived from the positions of fixes now rejected.
+            derive_course(&mut gps);
+        }
+    }
+
+    // --- absolute clock ----------------------------------------------------
+    let t0 = gps.iter().find(|f| f.valid && f.utc.is_some()).map(|f| {
+        let anchor = f.utc.unwrap();
+        anchor - chrono::Duration::microseconds(((f.time - times[0]) * 1e6).round() as i64)
+    });
 
     let hz_nominal = nominal_rate(grav_series, gpmf);
 
@@ -960,11 +1125,11 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
         hz_nominal,
         times,
         t0,
-        t0_is_fallback,
+        t0_is_fallback: false,
         duration_s,
         lean_deg: lean,
         pitch_deg: pitch,
-        yaw_rate_dps: yaw.iter().map(|v| v.to_degrees()).collect(),
+        yaw_rate_dps,
         lean_rate_dps: lean_rate,
         pitch_rate_dps: pitch_rate,
         accel_lon_g: a_lon,
@@ -1020,7 +1185,7 @@ fn resolve_lean_sign(
     let rate = course_rate(gps);
     let mut turn = Vec::new();
     let mut gps_turn = Vec::new();
-    for i in 0..lean.len() {
+    for (i, &turn_rate) in turn_rate_right.iter().enumerate().take(lean.len()) {
         // Below walking pace a lean angle means nothing and a GPS bearing is
         // noise, so neither side of the comparison is informative.
         if speed_at(i).unwrap_or(0.0) <= 6.0 {
@@ -1032,7 +1197,7 @@ fn resolve_lean_sign(
         if !rate[j].is_finite() {
             continue;
         }
-        turn.push(turn_rate_right[i]);
+        turn.push(turn_rate);
         gps_turn.push(rate[j]);
     }
 
@@ -1043,14 +1208,18 @@ fn resolve_lean_sign(
             gps_correlation: None,
             samples: turn.len(),
             flipped: correlation_sign(lean, turn_rate_right) < 0.0,
+            turn_rate_inverted: false,
             confidence: Confidence::Assumed,
         };
     }
 
     let r_convention = pearson(&turn, &gps_turn);
     // If the gyro-derived turn rate disagrees with GPS, our assumed handedness
-    // is wrong for this camera; invert the reference before using it.
-    let reference: Vec<f64> = if r_convention < 0.0 {
+    // is wrong for this camera; invert the reference before using it. The
+    // caller is told, because the reference is not the only thing read from
+    // the gyro: yaw rate and pitch rate are wrong in the same way.
+    let turn_rate_inverted = r_convention < 0.0;
+    let reference: Vec<f64> = if turn_rate_inverted {
         turn_rate_right.iter().map(|v| -v).collect()
     } else {
         turn_rate_right.to_vec()
@@ -1081,6 +1250,7 @@ fn resolve_lean_sign(
         gps_correlation: Some(r_convention),
         samples: lean_v.len(),
         flipped,
+        turn_rate_inverted,
         confidence,
     }
 }
@@ -1126,14 +1296,22 @@ fn calibrate_mount(grav: &[Vec3], reference: Option<&[usize]>) -> (Vec3, Vec3) {
 ///
 /// `upright` is the ascending list of master samples that were rolling fast
 /// enough and straight enough to be standing on their own wheels — the same
-/// set [`calibrate_mount`] was fitted from. The median lean over the ones near
-/// each instant is what upright reads there, and subtracting it leaves an
-/// angle measured against the machine rather than against the mount.
+/// set [`calibrate_mount`] was fitted from; see [`upright_samples`]. The median
+/// lean over the ones near each instant is what upright reads there, and
+/// subtracting it leaves an angle measured against the machine rather than
+/// against the mount.
 ///
-/// A median, not a mean: a corner that creeps under
-/// [`UPRIGHT_MAX_TURN_DPS`] — a long motorway sweeper, a roundabout taken
-/// wide — is a real lean wrongly admitted to the reference set, and a mean
-/// would let it drag the zero towards itself.
+/// A median, not a mean: a corner gentle enough to pass as upright — a long
+/// motorway sweeper, a roundabout taken wide — is a real lean wrongly admitted
+/// to the reference set, and a mean would let it drag the zero towards itself.
+///
+/// Where there is too little upright riding nearby to measure the zero — a
+/// run of corners longer than the widened window — it is interpolated between
+/// the measured points either side, and held from the nearest one before the
+/// first and after the last. It is *not* replaced by the whole-file median:
+/// that is the static zero this exists to improve on, and dropping to it in
+/// the middle of a drifting ride puts a step of however far the mount has
+/// crept into the lean angle, at both ends of the gap.
 ///
 /// Returns `None` when there is too little straight-line riding to say
 /// anything, which is the honest answer for a clip cut out of a single corner.
@@ -1146,35 +1324,33 @@ pub fn rolling_roll_zero(lean: &[f64], times: &[f64], upright: &[usize]) -> Opti
     // ascending, so `ref_t` is too and can be bisected.
     let ref_t: Vec<f64> = upright.iter().map(|&i| times[i]).collect();
     let ref_lean: Vec<f64> = upright.iter().map(|&i| lean[i]).collect();
-    let overall = median(&ref_lean);
 
-    // Everything between the first and last reference sample is interpolated;
-    // outside that span the nearest grid point is held, so a ride that starts
-    // or ends mid-corner keeps the zero of the riding either side of it rather
-    // than inventing one.
     let span = times[n - 1] - times[0];
     let steps = (span / ROLL_ZERO_GRID_S).ceil().max(1.0) as usize;
-    let mut grid = Vec::with_capacity(steps + 1);
-    for k in 0..=steps {
-        let t = times[0] + k as f64 * ROLL_ZERO_GRID_S;
-        let window = |half: f64| -> (usize, usize) {
-            (
-                ref_t.partition_point(|&x| x < t - half),
-                ref_t.partition_point(|&x| x <= t + half),
-            )
-        };
-        let (a, b) = window(ROLL_ZERO_HALF_WINDOW_S);
-        let (a, b) = if b - a >= ROLL_ZERO_MIN_LOCAL {
-            (a, b)
-        } else {
-            window(ROLL_ZERO_WIDE_HALF_WINDOW_S)
-        };
-        grid.push(if b - a >= ROLL_ZERO_MIN_WIDE {
-            median(&ref_lean[a..b])
-        } else {
-            overall
-        });
-    }
+    let measured: Vec<Option<f64>> = (0..=steps)
+        .map(|k| {
+            let t = times[0] + k as f64 * ROLL_ZERO_GRID_S;
+            let window = |half: f64| -> (usize, usize) {
+                (
+                    ref_t.partition_point(|&x| x < t - half),
+                    ref_t.partition_point(|&x| x <= t + half),
+                )
+            };
+            let (a, b) = window(ROLL_ZERO_HALF_WINDOW_S);
+            let (a, b) = if b - a >= ROLL_ZERO_MIN_LOCAL {
+                (a, b)
+            } else {
+                window(ROLL_ZERO_WIDE_HALF_WINDOW_S)
+            };
+            (b - a >= ROLL_ZERO_MIN_WIDE).then(|| median(&ref_lean[a..b]))
+        })
+        .collect();
+    let grid = fill_gaps(&measured).unwrap_or_else(|| {
+        // Enough upright riding in total but nowhere dense enough to measure a
+        // local zero: spread thinly over a very long recording. The whole-file
+        // median is then the only zero there is.
+        vec![median(&ref_lean); steps + 1]
+    });
     // Adjacent windows overlap by all but a second, so the grid is already
     // smooth; this only takes the corner off the step where a dense block of
     // reference samples enters or leaves a window.
@@ -1192,8 +1368,97 @@ pub fn rolling_roll_zero(lean: &[f64], times: &[f64], upright: &[usize]) -> Opti
     )
 }
 
+/// Fill the unmeasured points of an evenly spaced series: linearly between
+/// the measured points either side, and by holding the nearest one beyond the
+/// first and last. `None` when nothing was measured.
+fn fill_gaps(v: &[Option<f64>]) -> Option<Vec<f64>> {
+    let known: Vec<usize> = (0..v.len()).filter(|&k| v[k].is_some()).collect();
+    let (&first, &last) = (known.first()?, known.last()?);
+    let mut out = vec![0.0; v.len()];
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = if k <= first {
+            v[first].unwrap()
+        } else if k >= last {
+            v[last].unwrap()
+        } else {
+            // The measured neighbours either side of `k`.
+            let j = known.partition_point(|&x| x <= k);
+            let (a, b) = (known[j - 1], known[j.min(known.len() - 1)]);
+            let (va, vb) = (v[a].unwrap(), v[b].unwrap());
+            if a == b {
+                va
+            } else {
+                va + (vb - va) * (k - a) as f64 / (b - a) as f64
+            }
+        };
+    }
+    Some(out)
+}
+
+/// The master samples that count as upright: rolling on their own momentum,
+/// and carrying no more cornering load than `max_lean_deg` of lean would.
+///
+/// The load is speed times rate of turn, from GPS and the gyro — two sources
+/// that owe nothing to the mount calibration this set is used to fit, which is
+/// what keeps the fit from choosing its own reference.
+fn upright_samples(
+    speed_at: &impl Fn(usize) -> Option<f64>,
+    turn_rate: &[f64],
+    n: usize,
+    max_lean_deg: f64,
+) -> Vec<usize> {
+    let max_lateral = G * max_lean_deg.to_radians().tan();
+    (0..n)
+        .filter(|&i| {
+            let Some(v) = speed_at(i).filter(|&v| v > UPRIGHT_MIN_SPEED_MS) else {
+                return false;
+            };
+            (v * turn_rate[i]).abs() < max_lateral
+        })
+        .collect()
+}
+
+/// Measure the rotation that takes `GRAV` onto the accelerometer's vertical,
+/// over master samples where the accelerometer *is* the vertical.
+///
+/// Each sample gives one rotation: the axis `GRAV × â` and an angle whose sine
+/// is that cross product's length and whose cosine is `GRAV · â`. They are
+/// combined component-wise by median, which a motorcycle's accelerometer
+/// needs: it puts outliers through every reading. See [`GravTilt`] for why the
+/// result is the combined rotation and not the median of the per-sample angles.
+///
+/// The angle comes from both parts, `atan2(|cross|, dot)`, and not from the
+/// cross product alone. `asin(|cross|)` cannot tell a small tilt from one near
+/// 180° — two vectors pointing almost opposite ways have a short cross product
+/// too — so an accelerometer reading upside down relative to `GRAV` came out
+/// as a small, plausible correction and was applied.
+///
+/// `applied` is false when the tilt is too large to be a misalignment; the
+/// caller does the rotating. `None` below [`GRAV_TILT_MIN_SAMPLES`].
+fn fit_grav_tilt(grav: &[Vec3], acc: &[Vec3], reference: &[usize]) -> Option<GravTilt> {
+    if reference.len() < GRAV_TILT_MIN_SAMPLES {
+        return None;
+    }
+    let mut crosses = Vec::with_capacity(reference.len());
+    let mut dots = Vec::with_capacity(reference.len());
+    for &i in reference {
+        let a = normalize(&acc[i]);
+        crosses.push(cross(&grav[i], &a));
+        dots.push(dot(&grav[i], &a));
+    }
+    let r = median_vec(&crosses);
+    let angle = magnitude(&r).atan2(median(&dots));
+    Some(GravTilt {
+        angle_deg: angle.to_degrees(),
+        axis: normalize(&r),
+        samples: reference.len(),
+        applied: angle.to_degrees() <= GRAV_TILT_MAX_DEG,
+    })
+}
+
 /// Rate of turn about the vertical, in radians per second, positive to the
-/// right.
+/// right. `None` without a gyro: a rate that was not measured is unknown, not
+/// zero, and zero reads as dead straight to everything that gates on it.
 ///
 /// Note the negation. `dot(GYRO, GRAV)` is the rotation rate about the *up*
 /// axis, and in a right-handed frame a right-hand turn is clockwise seen from
@@ -1202,39 +1467,147 @@ pub fn rolling_roll_zero(lean: &[f64], times: &[f64], upright: &[usize]) -> Opti
 /// positive to the right, so they can be compared and plotted together without
 /// a per-channel sign table. The prototype left this one inverted relative to
 /// the others, which is why its viewer carries a hardcoded list of channels to
-/// multiply by −1.
-fn turn_rate_series(gyro: Option<&[Vec3]>, grav: &[Vec3], n: usize) -> Vec<f64> {
-    match gyro {
-        None => vec![0.0; n],
-        Some(gy) => {
-            let raw: Vec<f64> = (0..n).map(|i| -dot(&gy[i], &grav[i])).collect();
-            moving_average(&raw, 15)
-        }
-    }
+/// multiply by −1. Whether the camera's gyro really is right-handed is checked
+/// against GPS in [`resolve_lean_sign`].
+fn turn_rate_series(gyro: Option<&[Vec3]>, grav: &[Vec3], n: usize) -> Option<Vec<f64>> {
+    let gy = gyro?;
+    let raw: Vec<f64> = (0..n).map(|i| -dot(&gy[i], &grav[i])).collect();
+    Some(moving_average(&raw, 15))
 }
 
-/// Central-difference derivative of GPS speed on the master timeline.
+/// Central-difference derivative of GPS speed on the master timeline, in m/s².
+///
+/// `None` where either end of the difference has no valid fix. Such a sample
+/// is not coasting: its speed change was simply not measured, and the typical
+/// case -- braking into a tunnel, accelerating out of a dropout -- is exactly
+/// the one that must not pass as steady riding.
 fn speed_derivative(
     times: &[f64],
     speed_at: &impl Fn(usize) -> Option<f64>,
     n: usize,
     hz: f64,
-) -> Vec<f64> {
+) -> Vec<Option<f64>> {
     // Half a second either side: shorter than that and GPS speed quantisation
     // dominates the derivative.
     let step = ((hz / 2.0) as usize).max(1);
-    let mut dv = vec![0.0; n];
-    for i in 0..n {
-        let a = i.saturating_sub(step);
-        let b = (i + step).min(n - 1);
-        if let (Some(sa), Some(sb)) = (speed_at(a), speed_at(b)) {
+    (0..n)
+        .map(|i| {
+            let a = i.saturating_sub(step);
+            let b = (i + step).min(n - 1);
             let dt = times[b] - times[a];
-            if dt > 0.0 {
-                dv[i] = (sb - sa) / dt;
-            }
+            let (sa, sb) = (speed_at(a)?, speed_at(b)?);
+            (dt > 0.0).then(|| (sb - sa) / dt)
+        })
+        .collect()
+}
+
+/// The sense in which the gyro turns `GRAV`: `+1` when `dg/dt = -ω × g`, as it
+/// does for a right-handed gyro in a right-handed frame, and `-1` when it runs
+/// the other way.
+///
+/// It runs the other way on the reference clip, strongly: every axis of
+/// `dg/dt` correlates with `-ω × g` at r ≈ −0.94. Nothing is wrong with the
+/// gyro. `GRAV` has two axes swapped relative to the IMU streams, and a swap
+/// is a reflection, so the frame everything is resolved in is left-handed and
+/// every cross product computed in it comes out reversed. Dot products do not
+/// notice, which is why the rate of turn, `-ω · g`, is unaffected and why this
+/// went unseen until a channel built on a cross product was checked against
+/// the angle it describes.
+///
+/// Measured rather than assumed because it is a property of the camera's axis
+/// conventions, which differ between models, and because the measurement
+/// needs nothing but the two streams: no mount calibration, no GPS.
+fn gyro_handedness(gyro: &[Vec3], grav: &[Vec3], times: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 1..grav.len().saturating_sub(1) {
+        let dt = times[i + 1] - times[i - 1];
+        if dt <= 0.0 {
+            continue;
+        }
+        let dg = scale(&sub(&grav[i + 1], &grav[i - 1]), 1.0 / dt);
+        s += dot(&dg, &scale(&cross(&gyro[i], &grav[i]), -1.0));
+    }
+    if s < 0.0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// Central-difference derivative of a series against its timestamps, zero at
+/// the two ends.
+fn central_difference(v: &[f64], times: &[f64]) -> Vec<f64> {
+    let n = v.len();
+    let mut d = vec![0.0; n];
+    for i in 1..n.saturating_sub(1) {
+        let dt = times[i + 1] - times[i - 1];
+        if dt > 0.0 {
+            d[i] = (v[i + 1] - v[i - 1]) / dt;
         }
     }
-    dv
+    d
+}
+
+/// Reject fixes whose speed disagrees with the corner the IMU measured.
+///
+/// In a turn, speed is lateral acceleration over rate of turn — `v = a / ω` —
+/// and both of those come from the IMU, which does not lose lock. So wherever
+/// the machine is plainly cornering, the IMU says how fast it is going, and a
+/// receiver claiming a very different speed is wrong. The estimate is a median
+/// over [`IMU_SPEED_HALF_WINDOW_S`] either side, and is only made where most of
+/// that window is a well-defined corner — turning at
+/// [`IMU_SPEED_MIN_TURN_DPS`] or more, loaded at [`IMU_SPEED_MIN_LATERAL_G`] or
+/// more, the two agreeing on direction — because at corner entry and exit the
+/// ratio of two small, differently filtered numbers is noise.
+///
+/// The tolerance is wide. The IMU's estimate is itself rough — on the
+/// reference clip its ratio to GPS speed has a central 90 % of 0.5–1.5 — so
+/// this is for speeds that are wrong by multiples, like the reacquiring
+/// receiver described on [`Options::max_imu_speed_ratio`], not for refining
+/// good ones. Returns how many fixes it rejected.
+fn flag_speed_against_imu(
+    gps: &mut [GpsFix],
+    times: &[f64],
+    yaw_rate_dps: &[f64],
+    accel_lat_g: &[f64],
+    ratio: f64,
+) -> usize {
+    if ratio <= 1.0 || times.is_empty() {
+        return 0;
+    }
+    // The IMU's speed at each master sample, where it is well defined.
+    let imu_speed: Vec<Option<f64>> = yaw_rate_dps
+        .iter()
+        .zip(accel_lat_g)
+        .map(|(&y, &a)| {
+            let cornering = y.abs() >= IMU_SPEED_MIN_TURN_DPS
+                && a.abs() >= IMU_SPEED_MIN_LATERAL_G
+                && y.signum() == a.signum();
+            cornering.then(|| (a * G / y.to_radians()).abs())
+        })
+        .collect();
+
+    let mut rejected = 0;
+    for fix in gps.iter_mut().filter(|f| f.valid) {
+        let from = times.partition_point(|&t| t < fix.time - IMU_SPEED_HALF_WINDOW_S);
+        let to = times.partition_point(|&t| t <= fix.time + IMU_SPEED_HALF_WINDOW_S);
+        if to <= from {
+            continue;
+        }
+        let window: Vec<f64> = imu_speed[from..to].iter().flatten().copied().collect();
+        // Most of the window has to be corner, or the estimate is the entry
+        // or exit transient.
+        if window.len() * 5 < (to - from) * 4 {
+            continue;
+        }
+        let v_imu = median(&window);
+        if fix.speed_2d * ratio < v_imu || fix.speed_2d > v_imu * ratio {
+            fix.valid = false;
+            fix.reject = Some(Reject::ImplausibleSpeed);
+            rejected += 1;
+        }
+    }
+    rejected
 }
 
 /// Reorient a triplet series into the gravity frame.
@@ -1314,6 +1687,10 @@ fn nearest_index(times: &[f64], t: f64) -> Option<usize> {
 /// "Most recent" rather than "nearest" because a fix describes where the bike
 /// was when it was taken; holding it forward until the next one is the honest
 /// reading, and it matches the repeated GPS columns in the prototype's CSV.
+///
+/// A sample earlier than every fix has none. Handing it the first fix instead,
+/// as this once did, reported a position the bike had not yet reached: the
+/// first 100 ms of every clip cut from a ride showed where it would be next.
 fn build_gps_index(times: &[f64], gps: &[GpsFix]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(times.len());
     let mut j = 0usize;
@@ -1321,13 +1698,7 @@ fn build_gps_index(times: &[f64], gps: &[GpsFix]) -> Vec<Option<usize>> {
         while j + 1 < gps.len() && gps[j + 1].time <= t {
             j += 1;
         }
-        if gps.is_empty() {
-            out.push(None);
-        } else if gps[j].time <= t || j == 0 {
-            out.push(Some(j));
-        } else {
-            out.push(None);
-        }
+        out.push(gps.get(j).filter(|f| f.time <= t).map(|_| j));
     }
     out
 }
@@ -1382,6 +1753,7 @@ fn parse_gps9(s: &Series, opts: &Options) -> Vec<GpsFix> {
     }
     flag_frozen(&mut out, opts.frozen_run);
     flag_implausible(&mut out, opts.max_speed_ratio, opts.speed_floor_ms);
+    flag_speed_jumps(&mut out, opts.max_speed_accel_ms2);
     out
 }
 
@@ -1418,6 +1790,7 @@ fn parse_gps5(s: &Series, opts: &Options) -> Vec<GpsFix> {
     }
     flag_frozen(&mut out, opts.frozen_run);
     flag_implausible(&mut out, opts.max_speed_ratio, opts.speed_floor_ms);
+    flag_speed_jumps(&mut out, opts.max_speed_accel_ms2);
     out
 }
 
@@ -1465,6 +1838,49 @@ fn flag_implausible(gps: &mut [GpsFix], ratio: f64, floor_ms: f64) {
         } else {
             anchor = Some(i);
         }
+    }
+}
+
+/// Reject fixes whose speed jumps further than any machine can accelerate.
+///
+/// The position check compares a fix's movement against its speed, so it
+/// trusts the speed; this is the check on the speed itself. It looks for a
+/// spike: a fix whose speed is out of reach of the valid fix either side of
+/// it, when those two are within reach of each other. That catches the lone
+/// bad sample without ever having to decide which side of a sustained step is
+/// the wrong one -- which from speed alone cannot be done, and which a walk
+/// anchored on the last accepted fix gets wrong whenever the step's first
+/// fix is the bad one, rejecting the good fixes after it instead. A step
+/// through a corner is left to [`flag_speed_against_imu`], which has an
+/// independent speed to settle it with.
+///
+/// Neighbours more than a second away do not count: across a gap the machine
+/// really could have changed speed. Half a metre per second is added to the
+/// limit for receiver noise, which is what adjacent fixes can disagree by at
+/// a standstill.
+fn flag_speed_jumps(gps: &mut [GpsFix], max_accel_ms2: f64) {
+    const NOISE_MS: f64 = 0.5;
+    const MAX_NEIGHBOUR_S: f64 = 1.0;
+    if max_accel_ms2 <= 0.0 {
+        return;
+    }
+    let valid: Vec<usize> = (0..gps.len()).filter(|&i| gps[i].valid).collect();
+    let reach = |a: &GpsFix, b: &GpsFix| -> Option<bool> {
+        let dt = (b.time - a.time).abs();
+        (dt > 0.0 && dt <= MAX_NEIGHBOUR_S)
+            .then(|| (b.speed_2d - a.speed_2d).abs() <= max_accel_ms2 * dt + NOISE_MS)
+    };
+    let spikes: Vec<usize> = valid
+        .windows(3)
+        .filter(|w| {
+            let (p, i, q) = (&gps[w[0]], &gps[w[1]], &gps[w[2]]);
+            reach(p, i) == Some(false) && reach(i, q) == Some(false) && reach(p, q) == Some(true)
+        })
+        .map(|w| w[1])
+        .collect();
+    for i in spikes {
+        gps[i].valid = false;
+        gps[i].reject = Some(Reject::ImplausibleSpeed);
     }
 }
 

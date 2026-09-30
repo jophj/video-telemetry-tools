@@ -179,11 +179,15 @@ pub fn render_text(a: &Analysis) -> String {
         a.t0.trunc() as i64,
         ((a.t0 - a.t0.trunc()) * 1e9) as u32,
     );
-    if let Some(t0) = t0 {
-        s.push_str(&format!(
+    match t0 {
+        Some(t0) if a.has_absolute_clock() => s.push_str(&format!(
             "  Start     {}\n",
             t0.format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        ));
+        )),
+        // Times from the start of the recording would print as 1970.
+        _ => s.push_str(
+            "  Start     unknown: no GPS clock, so times run from the recording's start\n",
+        ),
     }
     s.push_str(&format!(
         "  Duration  {}\n",
@@ -306,11 +310,16 @@ pub fn render_json(a: &Analysis) -> serde_json::Value {
                         e.t.trunc() as i64,
                         ((e.t - e.t.trunc()) * 1e9) as u32,
                     ) {
-                        Some(t) => json!(t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
-                        None => Value::Null,
+                        Some(t) if a.has_absolute_clock() => {
+                            json!(t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                        }
+                        _ => Value::Null,
                     },
                 );
-                o.insert("epochSeconds".into(), json!(round(e.t, 3)));
+                o.insert(
+                    "epochSeconds".into(),
+                    if a.has_absolute_clock() { json!(round(e.t, 3)) } else { Value::Null },
+                );
                 o.insert("offsetSeconds".into(), json!(round(e.offset_s, 3)));
                 o.insert("offset".into(), json!(format_offset(e.offset_s)));
                 if let Some(v) = e.video_time_s {
@@ -384,6 +393,7 @@ pub fn render_json(a: &Analysis) -> serde_json::Value {
         "ride": {
             "source": a.source,
             "start": chrono::DateTime::from_timestamp(a.t0.trunc() as i64, 0)
+                .filter(|_| a.has_absolute_clock())
                 .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             "durationSeconds": round(a.cadence.duration_s, 3),
             "distanceMetres": round(a.distance_m, 1),

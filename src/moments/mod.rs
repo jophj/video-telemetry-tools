@@ -41,7 +41,8 @@ pub const LEAN_SUPPORT_TOLERANCE_DEG: f64 = 8.0;
 /// One sample of a ride, from whichever source.
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
-    /// Epoch seconds, fractional.
+    /// Epoch seconds, fractional -- or, for a source with no clock, seconds
+    /// from the start of the recording. See [`Analysis::has_absolute_clock`].
     pub t: f64,
     /// Where this happened, when that is known.
     ///
@@ -64,6 +65,10 @@ pub struct Sample {
     /// Total acceleration magnitude in g, 1.0 at rest.
     pub accel_total_g: Option<f64>,
     /// Seconds into the video, where the source is a recording.
+    ///
+    /// Into the video *file*, measured from its first sample, and not the raw
+    /// GPMF timestamp: a clip cut out of a recording keeps its parent's
+    /// timestamps, so on a clip the two differ by however far in it was cut.
     pub video_time_s: Option<f64>,
 }
 
@@ -471,6 +476,14 @@ fn select_top(mut candidates: Vec<Candidate>, top: usize, min_gap_s: f64) -> Vec
 /// Every curve peak is a candidate window start, because a window that is
 /// maximal must begin at one: sliding it forward from anywhere else only ever
 /// loses corners. The window is the half-open span `[start, start + length)`.
+///
+/// A window is anchored on its first corner, not its hardest. The sample it
+/// points at is where its video time, position and speed are read from, and
+/// a clip is cut from that instant for the window's length -- so pointing at
+/// the peak corner cut a clip starting wherever in the window the peak fell:
+/// a 100–110 s window peaking at 108 s became a 102–122 s clip, missing most
+/// of the corners it was chosen for. The peak is kept as `peak_lean`, for the
+/// label.
 fn curviest_windows(
     curves: &[Curve],
     window_s: f64,
@@ -494,7 +507,7 @@ fn curviest_windows(
         candidates.push(Candidate {
             t: start,
             score: count as f64,
-            index: peak.index,
+            index: start_curve.index,
             window: Some((start, end)),
             curve_count: Some(count),
             peak_lean: Some(peak.lean_deg),
@@ -576,6 +589,24 @@ pub struct Analysis {
     /// Declared rates from the source's own metadata, for comparison against
     /// the measured cadence. Display only.
     pub declared_hz: Vec<(String, f64)>,
+}
+
+/// The earliest instant a real clock can report, in epoch seconds: 2000-01-01,
+/// which is `GPS9`'s own epoch. Anything earlier is a time measured from the
+/// start of a recording, however long.
+const ABSOLUTE_CLOCK_FLOOR: f64 = 946_684_800.0;
+
+impl Analysis {
+    /// Whether sample times are real epoch seconds.
+    ///
+    /// A recording with no GPS clock is still worth analysing -- lean and the
+    /// IMU channels do not need one -- so its samples are timed from the start
+    /// of the recording instead. Those times are small numbers that would
+    /// otherwise print as moments in January 1970, so anything that renders a
+    /// date asks this first.
+    pub fn has_absolute_clock(&self) -> bool {
+        self.t0 >= ABSOLUTE_CLOCK_FLOOR
+    }
 }
 
 /// Analyse a ride.
@@ -933,30 +964,70 @@ fn lean_support_warning(entries: &[Entry], samples: &[Sample]) -> Option<String>
 /// would gain nothing. Lean and the acceleration channels are read from the
 /// master timeline at each fix's own instant, so their resolution is unaffected
 /// for the purposes of ranking.
+///
+/// A source with no GPS stream at all is sampled on the master timeline
+/// instead, with no position or speed: lean and the IMU channels are still
+/// worth ranking, and there are no fixes to sample at.
+///
+/// With GPS time, a fix is timed by its own UTC, falling back to the
+/// telemetry's clock for one that reports none. Without GPS time -- no
+/// receiver, or the older `GPS5`, which reports none -- every sample is timed
+/// in seconds from the start of the recording instead; see
+/// [`Analysis::has_absolute_clock`]. Such samples were dropped outright once,
+/// which left a source with no GPS clock nothing to analyse at all, lean
+/// included.
 pub fn samples_from_telemetry(t: &crate::telemetry::Telemetry) -> Vec<Sample> {
+    let clock = |time: f64| -> Option<f64> {
+        match t.t0 {
+            Some(_) => t.utc_of(time).map(|u| u.timestamp_micros() as f64 / 1e6),
+            None => t.video_time_of(time),
+        }
+    };
+    let imu = |i: usize, time: f64| -> Option<Sample> {
+        Some(Sample {
+            t: clock(time)?,
+            pos: None,
+            ele_m: None,
+            speed_ms: None,
+            lean_deg: Some(t.lean_deg[i]),
+            accel_lon_g: t.accel_lon_g.as_ref().map(|v| v[i]),
+            accel_lat_g: t.accel_lat_g.as_ref().map(|v| v[i]),
+            accel_total_g: t.accel_total_g.as_ref().map(|v| v[i]),
+            video_time_s: t.video_time_of(time),
+        })
+    };
+
+    if t.n == 0 {
+        return Vec::new();
+    }
+    if t.gps.is_empty() {
+        return (0..t.n).filter_map(|i| imu(i, t.times[i])).collect();
+    }
+
     let mut out = Vec::with_capacity(t.gps.len());
     let mut i = 0usize;
     for fix in &t.gps {
         while i + 1 < t.n && t.times[i + 1] <= fix.time {
             i += 1;
         }
-        let time = match fix.utc.or_else(|| t.utc_of(fix.time)) {
-            Some(x) => x,
-            None => continue,
-        };
-        out.push(Sample {
-            t: time.timestamp_micros() as f64 / 1e6,
-            // A rejected fix contributes no position at all. The camera keeps
-            // emitting coordinates after losing lock, and they are nonsense.
-            pos: fix.valid.then_some((fix.lat, fix.lon)),
-            ele_m: fix.valid.then_some(fix.alt_m),
-            speed_ms: fix.valid.then_some(fix.speed_2d),
-            lean_deg: Some(t.lean_deg[i]),
-            accel_lon_g: t.accel_lon_g.as_ref().map(|v| v[i]),
-            accel_lat_g: t.accel_lat_g.as_ref().map(|v| v[i]),
-            accel_total_g: t.accel_total_g.as_ref().map(|v| v[i]),
-            video_time_s: Some(fix.time),
-        });
+        // A fix can land a few milliseconds before the first IMU sample -- on
+        // a cut clip it usually does -- and its IMU channels are then that
+        // first sample's. So is its instant: a moment at -0.04 s is outside
+        // the video, and clip planning drops it.
+        let Some(mut s) = imu(i, fix.time.max(t.times[0])) else { continue };
+        if t.t0.is_some() {
+            if let Some(utc) = fix.utc {
+                s.t = utc.timestamp_micros() as f64 / 1e6;
+            }
+        }
+        // A rejected fix contributes no position at all. The camera keeps
+        // emitting coordinates after losing lock, and they are nonsense.
+        if fix.valid {
+            s.pos = Some((fix.lat, fix.lon));
+            s.ele_m = Some(fix.alt_m);
+            s.speed_ms = Some(fix.speed_2d);
+        }
+        out.push(s);
     }
     out
 }
@@ -1006,39 +1077,66 @@ pub fn samples_from_csv(text: &str) -> anyhow::Result<Vec<Sample>> {
     let i_alat = idx("accel_lat_g");
     let i_atot = idx("accel_total_g");
 
-    let mut out = Vec::new();
+    // `time_s` is the telemetry's own timeline, which on a clip cut out of a
+    // longer recording starts wherever it was cut from. A video position is
+    // measured from the first row instead, the same rule the telemetry itself
+    // uses; see `Telemetry::video_time_of`.
+    let mut video_origin: Option<f64> = None;
+    let mut rows: Vec<(Option<f64>, Sample)> = Vec::new();
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
+        let time_s = i_time
+            .and_then(|i| f.get(i))
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        if video_origin.is_none() {
+            video_origin = time_s;
+        }
         let get = |i: Option<usize>| -> Option<f64> {
             i.and_then(|i| f.get(i))
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .and_then(|s| s.parse().ok())
         };
-        let Some(utc) = f.get(i_utc).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let Ok(time) = chrono::DateTime::parse_from_rfc3339(utc) else {
-            continue;
-        };
+        let utc = f
+            .get(i_utc)
+            .map(|s| s.trim())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|time| time.timestamp_micros() as f64 / 1e6);
+        let video_time_s = time_s.zip(video_origin).map(|(t, origin)| t - origin);
         // A row with no position is kept: the receiver could not place it, but
         // the IMU channels on that row are still valid.
         let pos = get(Some(i_lat)).zip(get(Some(i_lon)));
-        out.push(Sample {
-            t: time.timestamp_micros() as f64 / 1e6,
-            pos,
-            ele_m: get(i_ele),
-            speed_ms: get(i_speed).map(|kmh| kmh / 3.6),
-            lean_deg: get(i_lean),
-            accel_lon_g: get(i_alon),
-            accel_lat_g: get(i_alat),
-            accel_total_g: get(i_atot),
-            video_time_s: get(i_time),
-        });
+        rows.push((
+            utc,
+            Sample {
+                // Settled below, once it is known which clock the file has.
+                t: f64::NAN,
+                pos,
+                ele_m: get(i_ele),
+                speed_ms: get(i_speed).map(|kmh| kmh / 3.6),
+                lean_deg: get(i_lean),
+                accel_lon_g: get(i_alon),
+                accel_lat_g: get(i_alat),
+                accel_total_g: get(i_atot),
+                video_time_s,
+            },
+        ));
     }
+    // A file with a clock is timed by it, and a row the clock missed is
+    // dropped rather than guessed at. A file with no clock at all -- written
+    // from a recording with no GPS time -- is timed from its first row, the
+    // same way `samples_from_telemetry` times such a recording.
+    let has_clock = rows.iter().any(|(utc, _)| utc.is_some());
+    let out: Vec<Sample> = rows
+        .into_iter()
+        .filter_map(|(utc, mut s)| {
+            s.t = if has_clock { utc? } else { s.video_time_s? };
+            Some(s)
+        })
+        .collect();
     if out.is_empty() {
         anyhow::bail!("the CSV contained no rows with a usable timestamp");
     }
