@@ -80,6 +80,13 @@ pub const REGISTRY: &[Encoder] = &[
     Encoder { name: "prores_ks", kind: Kind::Cpu, codec: "prores", pix_fmt: "yuv422p10le", default_q: None, notes: "ProRes 422 HQ, for NLE round-tripping" },
 ];
 
+/// Whether an encoder is fed more than 8 bits per sample.
+pub fn is_high_bit_depth(enc: &Encoder) -> bool {
+    // p010, p010le, p210le, yuv420p10le, yuv422p10le: every high-depth format
+    // in the registry names its depth.
+    enc.pix_fmt.contains("10")
+}
+
 pub fn lookup(name: &str) -> Option<&'static Encoder> {
     REGISTRY.iter().find(|e| e.name == name)
 }
@@ -192,6 +199,14 @@ impl Survey {
             .map(|(_, s)| *s)
     }
 
+    /// Overrule one verdict, e.g. for an encoder that passed the survey but
+    /// failed at the real output size.
+    pub fn set_status(&mut self, name: &str, status: Status) {
+        if let Some(entry) = self.entries.iter_mut().find(|(e, _)| e.name == name) {
+            entry.1 = status;
+        }
+    }
+
     pub fn is_usable(&self, name: &str) -> bool {
         self.status(name) == Some(Status::Usable)
     }
@@ -255,40 +270,109 @@ impl Survey {
     }
 }
 
+/// How long a hardware encoder's failure is believed.
+///
+/// A success is a fact about the machine, but a failure is often a moment: a
+/// driver not yet loaded, a GPU busy with another encode, an eGPU unplugged.
+/// Caching that forever would hide the encoder until someone thought to pass
+/// `--reprobe`, so a failure is retried once it is this old.
+const FAILURE_TTL_S: u64 = 60 * 60;
+
 /// Survey the machine, using the cache unless told to re-probe.
 pub fn survey(ff: &Ffmpeg, reprobe: bool) -> Survey {
-    if !reprobe {
-        if let Some(cached) = read_cache(&ff.version) {
-            return cached;
+    let key = cache_key(ff);
+    let now = unix_now();
+    let cached = if reprobe { None } else { read_cache(&key) };
+
+    // Everything cached and fresh: nothing to test.
+    if let Some(c) = &cached {
+        if c.iter().all(|(_, _, at)| !expired(*at, now)) {
+            return Survey {
+                entries: c.iter().map(|(e, s, _)| (*e, *s)).collect(),
+                version: ff.version.clone(),
+                from_cache: true,
+            };
         }
     }
 
-    let listed: Vec<String> = ff.listed_encoders();
-    let mut entries = Vec::with_capacity(REGISTRY.len());
-    for enc in REGISTRY {
-        let status = if !listed.iter().any(|l| l == enc.name) {
-            Status::NotBuilt
-        } else if enc.kind == Kind::Gpu {
-            // Hardware has to be proven. Software is trusted from the build
-            // list: if it compiled in, it runs.
-            if ff.test_encoder(enc) {
-                Status::Usable
-            } else {
-                Status::Unusable
+    // Otherwise test only what the cache cannot vouch for: everything on a
+    // miss, just the stale failures on a hit.
+    let listed: Option<Vec<String>> = cached.is_none().then(|| ff.listed_encoders());
+    let mut rows: Vec<(&'static Encoder, Status, Option<u64>)> = Vec::with_capacity(REGISTRY.len());
+    for (i, enc) in REGISTRY.iter().enumerate() {
+        let previous = cached.as_ref().map(|c| c[i]);
+        let row = match (previous, &listed) {
+            (Some((_, status, at)), _) if !expired(at, now) => (enc, status, at),
+            (Some(_), _) => probe_row(ff, enc, now),
+            (None, Some(listed)) if !listed.iter().any(|l| l == enc.name) => {
+                (enc, Status::NotBuilt, None)
             }
-        } else {
-            Status::Usable
+            (None, _) if enc.kind == Kind::Gpu => probe_row(ff, enc, now),
+            // Software is trusted from the build list: if it compiled in, it
+            // runs.
+            (None, _) => (enc, Status::Usable, None),
         };
-        entries.push((enc, status));
+        rows.push(row);
     }
 
-    let survey = Survey {
-        entries,
+    write_cache(&key, &rows);
+    Survey {
+        entries: rows.iter().map(|(e, s, _)| (*e, *s)).collect(),
         version: ff.version.clone(),
         from_cache: false,
-    };
-    write_cache(&survey);
-    survey
+    }
+}
+
+/// Test one hardware encoder, stamping a failure with when it was seen.
+fn probe_row(ff: &Ffmpeg, enc: &'static Encoder, now: u64) -> (&'static Encoder, Status, Option<u64>) {
+    if ff.test_encoder(enc) {
+        (enc, Status::Usable, None)
+    } else {
+        (enc, Status::Unusable, Some(now))
+    }
+}
+
+/// Whether a cached failure has outlived its [`FAILURE_TTL_S`].
+fn expired(failed_at: Option<u64>, now: u64) -> bool {
+    failed_at.is_some_and(|at| now.saturating_sub(at) >= FAILURE_TTL_S)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What the cached verdicts are about: this exact ffmpeg binary.
+///
+/// The version banner alone is not enough. Two installs can print the same
+/// banner and be built with different encoders — a Homebrew ffmpeg and a
+/// static build of the same release, say — and `--ffmpeg` switches between
+/// them per invocation. So the key is the banner plus the binary's canonical
+/// path, size and modification time, and replacing or pointing elsewhere
+/// re-probes automatically.
+fn cache_key(ff: &Ffmpeg) -> String {
+    let path = std::fs::canonicalize(&ff.ffmpeg).unwrap_or_else(|_| ff.ffmpeg.clone());
+    let (size, mtime) = std::fs::metadata(&path)
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (m.len(), mtime)
+        })
+        .unwrap_or((0, 0));
+    // Tabs and newlines would break the line-oriented file; neither belongs
+    // in a sane path, and replacing them only risks a spurious re-probe.
+    let clean = |s: String| s.replace(['\t', '\n', '\r'], " ");
+    format!(
+        "{}\t{}\t{size}\t{mtime}",
+        clean(ff.version.clone()),
+        clean(path.display().to_string())
+    )
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -296,20 +380,29 @@ fn cache_path() -> Option<PathBuf> {
     Some(dirs.cache_dir().join("encoders.txt"))
 }
 
-/// The cache is a plain text file keyed by the ffmpeg version banner.
+/// The cache is a plain text file whose first line is the [`cache_key`].
 ///
 /// Probing a dozen hardware encoders costs a second or two, which is nothing
-/// once but irritating on every invocation. Keying on the version string means
-/// an ffmpeg upgrade re-probes automatically.
-fn read_cache(version: &str) -> Option<Survey> {
+/// once but irritating on every invocation. Each following line is an encoder,
+/// its verdict and, for a failure, when it was seen.
+///
+/// Returned in registry order, one row per encoder, or `None` when the cache
+/// is missing, for another binary, or written by an older registry that does
+/// not mention every encoder — re-probing beats reporting one wrongly.
+fn read_cache(key: &str) -> Option<Vec<(&'static Encoder, Status, Option<u64>)>> {
     let text = std::fs::read_to_string(cache_path()?).ok()?;
+    parse_cache(&text, key)
+}
+
+fn parse_cache(text: &str, key: &str) -> Option<Vec<(&'static Encoder, Status, Option<u64>)>> {
     let mut lines = text.lines();
-    if lines.next()? != version {
+    if lines.next()? != key {
         return None;
     }
-    let mut found: HashMap<&str, Status> = HashMap::new();
+    let mut found: HashMap<&str, (Status, Option<u64>)> = HashMap::new();
     for line in lines {
-        let Some((name, status)) = line.split_once('\t') else {
+        let mut parts = line.split('\t');
+        let (Some(name), Some(status)) = (parts.next(), parts.next()) else {
             continue;
         };
         let status = match status {
@@ -318,41 +411,45 @@ fn read_cache(version: &str) -> Option<Survey> {
             "notbuilt" => Status::NotBuilt,
             _ => continue,
         };
+        // A failure without a time is from a cache that predates the TTL;
+        // treating it as ancient gets it retried.
+        let at = (status == Status::Unusable)
+            .then(|| parts.next().and_then(|t| t.parse().ok()).unwrap_or(0));
         if let Some(e) = lookup(name) {
-            found.insert(e.name, status);
+            found.insert(e.name, (status, at));
         }
     }
-    // A cache written by an older registry may not mention every encoder; if
-    // any is missing, re-probe rather than reporting it wrongly.
-    let entries: Vec<(&'static Encoder, Status)> = REGISTRY
+    REGISTRY
         .iter()
-        .map(|e| found.get(e.name).map(|s| (e, *s)))
-        .collect::<Option<Vec<_>>>()?;
-    Some(Survey {
-        entries,
-        version: version.to_string(),
-        from_cache: true,
-    })
+        .map(|e| found.get(e.name).map(|(s, at)| (e, *s, *at)))
+        .collect()
 }
 
-fn write_cache(survey: &Survey) {
-    let Some(path) = cache_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+fn render_cache(key: &str, rows: &[(&'static Encoder, Status, Option<u64>)]) -> String {
     let mut text = String::new();
-    text.push_str(&survey.version);
+    text.push_str(key);
     text.push('\n');
-    for (e, s) in &survey.entries {
+    for (e, s, at) in rows {
         let word = match s {
             Status::Usable => "usable",
             Status::Unusable => "unusable",
             Status::NotBuilt => "notbuilt",
         };
-        text.push_str(&format!("{}\t{}\n", e.name, word));
+        match at {
+            Some(at) => text.push_str(&format!("{}\t{word}\t{at}\n", e.name)),
+            None => text.push_str(&format!("{}\t{word}\n", e.name)),
+        }
+    }
+    text
+}
+
+fn write_cache(key: &str, rows: &[(&'static Encoder, Status, Option<u64>)]) {
+    let Some(path) = cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
     // A failure to cache is not a failure to work.
-    let _ = std::fs::write(path, text);
+    let _ = std::fs::write(path, render_cache(key, rows));
 }
 
 /// Rate-control and pixel-format arguments for an encoder.
@@ -477,4 +574,65 @@ pub fn video_args(enc: &Encoder, quality: Option<u32>, vaapi_filter: bool) -> Ve
         a.extend(["-tag:v".into(), "hvc1".into()]);
     }
     a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ff_at(path: &str) -> Ffmpeg {
+        Ffmpeg {
+            ffmpeg: PathBuf::from(path),
+            ffprobe: PathBuf::from("ffprobe"),
+            version: "ffmpeg version 9.0.2".into(),
+        }
+    }
+
+    #[test]
+    fn two_binaries_with_one_banner_do_not_share_a_cache() {
+        // Same banner, different installs: a static build and a package-manager
+        // build of one release can expose entirely different encoders.
+        assert_ne!(cache_key(&ff_at("/opt/a/ffmpeg")), cache_key(&ff_at("/opt/b/ffmpeg")));
+    }
+
+    #[test]
+    fn a_cache_for_another_binary_is_ignored() {
+        let rows: Vec<_> = REGISTRY.iter().map(|e| (e, Status::Usable, None)).collect();
+        let text = render_cache("key-a", &rows);
+        assert!(parse_cache(&text, "key-a").is_some());
+        assert!(parse_cache(&text, "key-b").is_none());
+    }
+
+    #[test]
+    fn a_hardware_failure_is_remembered_only_for_a_while() {
+        let rows: Vec<_> = REGISTRY
+            .iter()
+            .map(|e| match e.kind {
+                Kind::Gpu => (e, Status::Unusable, Some(1_000)),
+                Kind::Cpu => (e, Status::Usable, None),
+            })
+            .collect();
+        let parsed = parse_cache(&render_cache("k", &rows), "k").unwrap();
+        let (_, status, at) = parsed.iter().find(|(e, _, _)| e.kind == Kind::Gpu).unwrap();
+        assert_eq!(*status, Status::Unusable);
+        assert_eq!(*at, Some(1_000), "the failure keeps when it was seen");
+        // Fresh within the TTL, retried after it; a success never expires.
+        assert!(!expired(*at, 1_000 + FAILURE_TTL_S - 1));
+        assert!(expired(*at, 1_000 + FAILURE_TTL_S));
+        assert!(!expired(None, u64::MAX));
+    }
+
+    #[test]
+    fn an_undated_failure_from_an_old_cache_is_retried() {
+        let mut text = String::from("k\n");
+        for e in REGISTRY {
+            let word = if e.kind == Kind::Gpu { "unusable" } else { "usable" };
+            text.push_str(&format!("{}\t{word}\n", e.name));
+        }
+        let parsed = parse_cache(&text, "k").unwrap();
+        assert!(parsed
+            .iter()
+            .filter(|(_, s, _)| *s == Status::Unusable)
+            .all(|(_, _, at)| expired(*at, unix_now())));
+    }
 }

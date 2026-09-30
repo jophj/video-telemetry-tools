@@ -13,12 +13,13 @@
 //! with no Intel GPU, and both fail only once the real encode starts — which,
 //! on a 25-minute 360 stitch, is an hour in. So every hardware encoder is
 //! verified up front with a one-frame test encode, and the verdicts are cached
-//! against the ffmpeg version so the check is paid for once.
+//! against the ffmpeg binary so the check is paid for once.
 
 pub mod encoders;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub use encoders::{Encoder, Kind, Preset, Status};
 
@@ -45,12 +46,34 @@ pub enum FfmpegError {
 
 type Result<T> = std::result::Result<T, FfmpegError>;
 
+/// The frame size every hardware encoder is proven at during the survey.
+///
+/// The Max 2's native equirectangular output, so a verdict holds for the
+/// common case without a second probe. A larger output, such as the original
+/// MAX's 5376x2688, is re-proven at its real size just before the encode; see
+/// `render::choose_encoder_for_size`.
+pub const PROBE_SIZE: (u32, u32) = (3840, 1920);
+
+/// How long a one-frame probe may take before it is presumed hung.
+const PROBE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A path as an ffmpeg or ffprobe URL that can only mean that file.
+///
+/// ffmpeg reads a leading `-` as an option and anything before a colon as a
+/// protocol, so `-x.mp4` or `clip:1.mov` would be taken for something else
+/// entirely. The explicit `file:` protocol has neither problem, and ffmpeg
+/// still guesses the container from the extension after it.
+pub fn file_url(path: &Path) -> String {
+    format!("file:{}", path.display())
+}
+
 /// A located ffmpeg installation.
 #[derive(Debug, Clone)]
 pub struct Ffmpeg {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
-    /// First line of `ffmpeg -version`, used as the cache key.
+    /// First line of `ffmpeg -version`, shown in the survey and part of the
+    /// cache key.
     pub version: String,
 }
 
@@ -190,11 +213,26 @@ impl Ffmpeg {
         nodes.into_iter().next()
     }
 
-    /// Verify one encoder by actually encoding a single frame with it.
+    /// Verify one encoder by actually encoding a single frame with it, at the
+    /// size the survey assumes.
+    pub fn test_encoder(&self, enc: &Encoder) -> bool {
+        let (w, h) = PROBE_SIZE;
+        self.test_encoder_at(enc, w, h)
+    }
+
+    /// Verify one encoder by encoding a single `w` x `h` frame with it.
+    ///
+    /// The frame is fed exactly as a real encode feeds it: the encoder's own
+    /// pixel format and profile, from the same [`encoders::video_args`] the
+    /// render uses. A tiny 8-bit probe passes on hardware that then refuses
+    /// the real 10-bit stream, and on H.264 encoders whose width limit sits
+    /// below a stitched frame, so the size matters as much as the format.
     ///
     /// `-f null -` rather than a path, so there is no `/dev/null` versus `NUL`
-    /// difference between platforms.
-    pub fn test_encoder(&self, enc: &Encoder) -> bool {
+    /// difference between platforms. A wedged driver can hang an encoder
+    /// rather than fail it, so the probe is given a deadline and a hang counts
+    /// as a failure.
+    pub fn test_encoder_at(&self, enc: &Encoder, w: u32, h: u32) -> bool {
         let mut args: Vec<String> = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
@@ -215,23 +253,47 @@ impl Ffmpeg {
             "-f".into(),
             "lavfi".into(),
             "-i".into(),
-            "color=c=black:s=320x240:r=1:d=1".into(),
+            format!("color=c=black:s={w}x{h}:r=1:d=1"),
         ]);
         if vaapi {
             // VAAPI encodes from GPU memory, so frames have to be uploaded.
             args.push("-vf".into());
             args.push(format!("format={},hwupload", enc.pix_fmt));
         }
-        args.extend([
-            "-frames:v".into(),
-            "1".into(),
-            "-c:v".into(),
-            enc.name.into(),
-            "-f".into(),
-            "null".into(),
-            "-".into(),
-        ]);
-        self.run(&args).is_ok()
+        args.extend(["-frames:v".into(), "1".into()]);
+        args.extend(encoders::video_args(enc, None, vaapi));
+        args.extend(["-f".into(), "null".into(), "-".into()]);
+        self.run_with_deadline(&args, PROBE_DEADLINE)
+    }
+
+    /// Run ffmpeg quietly, killing it if it outlives `deadline`.
+    ///
+    /// Only for probes, whose output is not wanted: a real encode can
+    /// legitimately take hours and must never be cut off.
+    fn run_with_deadline(&self, args: &[String], deadline: Duration) -> bool {
+        let Ok(mut child) = Command::new(&self.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if started.elapsed() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ ffprobe
@@ -245,9 +307,15 @@ impl Ffmpeg {
             "format=duration",
             "-of",
             "default=nw=1:nk=1",
-            &path.to_string_lossy(),
+            &file_url(path),
         ])?;
-        Ok(out.trim().parse().unwrap_or(0.0))
+        // A zero here would read as an empty file rather than as a failure,
+        // and anything clamped against it would silently come out empty.
+        out.trim().parse().map_err(|_| FfmpegError::Failed {
+            program: "ffprobe".into(),
+            status: "no duration".into(),
+            stderr: format!("could not read a duration for {}: {:?}", path.display(), out.trim()),
+        })
     }
 
     /// Every stream in the file.
@@ -265,7 +333,7 @@ impl Ffmpeg {
             "json",
             "-show_entries",
             "stream=index,codec_type,codec_name,codec_tag_string,channels,width,height,r_frame_rate",
-            &path.to_string_lossy(),
+            &file_url(path),
         ])?;
         let parsed: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
             FfmpegError::Failed {

@@ -1,17 +1,19 @@
 //! A local web server for the telemetry viewer.
 //!
-//! Three routes: the page itself, the telemetry as JSON, and the video with
-//! byte-range support. The last is the one that matters — the browser will not
+//! Four routes: the page itself, the telemetry as JSON, a little JSON about
+//! the video, and the video with byte-range support. The last is the one that matters — the browser will not
 //! scrub a video it cannot seek within, and these files run to hundreds of
 //! megabytes, so serving them whole is not an option.
 //!
-//! Deliberately synchronous, on `tiny_http`. One subcommand wanting a socket is
-//! not a reason to pull an async runtime into a tool that is otherwise a
-//! straight-line pipeline.
+//! Deliberately synchronous, on `tiny_http`, with a thread per request. One
+//! subcommand wanting a socket is not a reason to pull an async runtime into a
+//! tool that is otherwise a straight-line pipeline, and a browser opens only a
+//! handful of connections to a page like this.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
@@ -26,8 +28,22 @@ pub struct Options {
     pub video: PathBuf,
     /// The telemetry JSON to serve, already rendered.
     pub telemetry_json: String,
+    /// The file the telemetry came from, named in the page's caption.
+    pub telemetry_source: Option<String>,
+    /// The video's frame rate, which the page steps frames by.
+    pub fps: Option<f64>,
     pub port: u16,
     pub open_browser: bool,
+}
+
+/// Everything a request handler needs, shared across the handler threads.
+struct Site {
+    video: PathBuf,
+    video_size: u64,
+    mime: &'static str,
+    telemetry_json: String,
+    info_json: String,
+    port: u16,
 }
 
 pub fn serve(opts: Options) -> anyhow::Result<()> {
@@ -47,22 +63,64 @@ pub fn serve(opts: Options) -> anyhow::Result<()> {
         open_in_browser(&url);
     }
 
-    let video_size = std::fs::metadata(&opts.video)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let mime = mime_for(&opts.video);
+    let site = Arc::new(Site {
+        video_size: std::fs::metadata(&opts.video).map(|m| m.len()).unwrap_or(0),
+        mime: mime_for(&opts.video),
+        info_json: serde_json::json!({
+            "fps": opts.fps.filter(|f| f.is_finite() && *f > 0.0),
+            "telemetry": opts.telemetry_source,
+        })
+        .to_string(),
+        video: opts.video,
+        telemetry_json: opts.telemetry_json,
+        port: opts.port,
+    });
 
+    // One thread per request. Served one at a time, a single media response
+    // stalled on a slow or abandoned connection held up everything behind it,
+    // telemetry and page included, until the socket timed out.
     for request in server.incoming_requests() {
-        // A dropped connection mid-scrub is normal, not an error worth
-        // reporting: the browser abandons ranges it no longer needs.
-        let _ = match request.url().split('?').next().unwrap_or("/") {
-            "/" | "/index.html" => respond_html(request, VIEWER_HTML),
-            "/telemetry.json" => respond_json(request, &opts.telemetry_json),
-            "/video" => respond_video(request, &opts.video, video_size, mime),
-            _ => respond_not_found(request),
-        };
+        let site = Arc::clone(&site);
+        std::thread::spawn(move || handle(request, &site));
     }
     Ok(())
+}
+
+fn handle(request: Request, site: &Site) {
+    // A page on any other origin can resolve its own hostname to 127.0.0.1
+    // (DNS rebinding) and then read this server as same-origin. The Host
+    // header still names the attacker's domain, so anything but this server's
+    // own name is refused.
+    let host = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string());
+    if !host_allowed(host.as_deref(), site.port) {
+        let _ = request.respond(Response::from_string("forbidden").with_status_code(StatusCode(403)));
+        return;
+    }
+    // A dropped connection mid-scrub is normal, not an error worth
+    // reporting: the browser abandons ranges it no longer needs.
+    let _ = match request.url().split('?').next().unwrap_or("/") {
+        "/" | "/index.html" => respond_html(request, VIEWER_HTML),
+        "/telemetry.json" => respond_json(request, &site.telemetry_json),
+        "/info.json" => respond_json(request, &site.info_json),
+        "/video" => respond_video(request, &site.video, site.video_size, site.mime),
+        _ => respond_not_found(request),
+    };
+}
+
+/// Whether a request's `Host` names this server: loopback, on its own port.
+pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else {
+        // HTTP/1.1 requires it, and every browser sends it.
+        return false;
+    };
+    let host = host.trim().to_ascii_lowercase();
+    ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|name| host == format!("{name}:{port}"))
 }
 
 fn header(name: &str, value: &str) -> Header {

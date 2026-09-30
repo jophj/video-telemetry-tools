@@ -111,6 +111,7 @@ fn the_filter_graph_has_the_shape_the_layout_requires() {
         },
         "pry",
         "lanczos",
+        "yuv444p",
         None,
     );
 
@@ -137,7 +138,16 @@ fn the_filter_graph_has_the_shape_the_layout_requires() {
     assert!(g.ends_with("[vout]"));
 
     // A zero rotation should not emit rotation arguments at all.
-    let plain = render::filter_graph(&layout, 3840, 1920, Rotation::default(), "pry", "lanczos", None);
+    let plain = render::filter_graph(
+        &layout,
+        3840,
+        1920,
+        Rotation::default(),
+        "pry",
+        "lanczos",
+        "yuv444p",
+        None,
+    );
     assert!(!plain.contains("yaw="));
 }
 
@@ -223,7 +233,7 @@ fn a_clip_keeps_every_stream_but_the_timecode() {
         frame_rate: 30000.0 / 1001.0,
     };
     let cmd = render::clip_args(
-        &layout,
+        &layout.timecode,
         std::path::Path::new("in.360"),
         std::path::Path::new("out.360"),
         100.0,
@@ -242,6 +252,147 @@ fn a_clip_keeps_every_stream_but_the_timecode() {
     assert!(cmd.contains("-avoid_negative_ts make_zero"));
     // -ss must precede -i to be an input seek.
     assert!(cmd.find("-ss").unwrap() < cmd.find("-i").unwrap());
+}
+
+fn test_layout() -> render::Layout {
+    render::Layout {
+        video: vec![0, 5],
+        audio: Some(1),
+        ambisonic: Some(6),
+        gpmd: Some(4),
+        timecode: vec![3],
+        geometry: Geometry::derive(3008, 960).unwrap(),
+        frame_rate: 30000.0 / 1001.0,
+    }
+}
+
+#[test]
+fn a_ten_bit_output_is_stitched_at_ten_bits() {
+    // Stitching at 8 bits and widening to p010le afterwards would be an 8-bit
+    // picture in a 10-bit file, banding included.
+    let layout = test_layout();
+    let path = std::path::Path::new;
+    for (name, work) in [
+        ("libx265", "yuv444p10le"),
+        ("hevc_videotoolbox", "yuv444p10le"),
+        ("prores_ks", "yuv444p10le"),
+        ("libx264", "yuv444p"),
+        ("h264_nvenc", "yuv444p"),
+    ] {
+        let enc = encoders::lookup(name).unwrap();
+        assert_eq!(render::working_format(Some(enc)), work, "{name}");
+        let cmd = render::convert_args(
+            &layout,
+            path("in.360"),
+            path("out.mp4"),
+            enc,
+            None,
+            &ConvertOptions::default(),
+        )
+        .join(" ");
+        assert!(cmd.contains(&format!("[0:0]format={work},split=9")), "{name}: {cmd}");
+    }
+    // A JPEG preview is 8-bit whatever the encoder would have been.
+    assert_eq!(render::working_format(None), "yuv444p");
+}
+
+#[test]
+fn a_preview_never_touches_vaapi() {
+    // A JPEG is written from system memory; frames uploaded to the GPU for a
+    // VAAPI encoder would have nowhere to go, and the preview would fail.
+    let layout = test_layout();
+    let path = std::path::Path::new;
+    let vaapi = encoders::lookup("hevc_vaapi").unwrap();
+    let opts = ConvertOptions {
+        preview: true,
+        ..Default::default()
+    };
+    let dev = std::path::Path::new("/dev/dri/renderD128");
+    let preview = render::convert_args(&layout, path("in.360"), path("p.jpg"), vaapi, Some(dev), &opts)
+        .join(" ");
+    assert!(!preview.contains("hwupload"), "{preview}");
+    assert!(!preview.contains("-vaapi_device"), "{preview}");
+    assert_eq!(preview, render::preview_args(&layout, path("in.360"), path("p.jpg"), &opts).join(" "));
+
+    // The real encode still uploads.
+    let encode = render::convert_args(
+        &layout,
+        path("in.360"),
+        path("o.mp4"),
+        vaapi,
+        Some(dev),
+        &ConvertOptions::default(),
+    )
+    .join(" ");
+    assert!(encode.contains("hwupload") && encode.contains("-vaapi_device"));
+}
+
+#[test]
+fn paths_reach_ffmpeg_as_files_whatever_they_look_like() {
+    // A leading '-' reads as an option and a colon as a protocol; `file:`
+    // leaves ffmpeg no other reading.
+    let layout = test_layout();
+    let odd_in = std::path::Path::new("-ride:1.360");
+    let odd_out = std::path::Path::new("-out:1.mp4");
+    let chapters = std::path::PathBuf::from("-ch:1.txt");
+    let enc = encoders::lookup("libx265").unwrap();
+    let opts = ConvertOptions {
+        chapters: Some(chapters),
+        ..Default::default()
+    };
+    let cmd = render::convert_args(&layout, odd_in, odd_out, enc, None, &opts);
+    assert!(cmd.contains(&"file:-ride:1.360".to_string()), "{cmd:?}");
+    assert!(cmd.contains(&"file:-ch:1.txt".to_string()), "{cmd:?}");
+    assert_eq!(cmd.last().unwrap(), "file:-out:1.mp4");
+    // The chapters are an input, so they must precede the output options.
+    let ch_at = cmd.iter().position(|a| a == "file:-ch:1.txt").unwrap();
+    let map_at = cmd.iter().position(|a| a == "-map").unwrap();
+    assert!(ch_at < map_at, "{cmd:?}");
+
+    let clip = render::clip_args(&[], odd_in, std::path::Path::new("-c:1.360"), 1.0, 2.0, false);
+    assert!(clip.contains(&"file:-ride:1.360".to_string()));
+    assert_eq!(clip.last().unwrap(), "file:-c:1.360");
+}
+
+#[test]
+fn a_segment_is_levelled_by_its_own_gravity() {
+    use gmax::gpmf::Series;
+    // Ten seconds upright, then ten seconds pitched hard over, at 10 Hz, on a
+    // timeline that starts at 1098 s the way a cut clip's does.
+    let mut values = Vec::new();
+    let mut times = Vec::new();
+    for i in 0..200 {
+        times.push(1098.0 + i as f64 * 0.1);
+        values.extend(if i < 100 { [0.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0] });
+    }
+    let grav = Series {
+        device_id: 1,
+        device_name: None,
+        key: gmax::fourcc::FourCc::from_str_lossy("GRAV"),
+        name: None,
+        orin: None,
+        units: Vec::new(),
+        type_str: None,
+        components: 3,
+        values,
+        times,
+        tmpc: Vec::new(),
+    };
+
+    let (whole, n) = render::mean_gravity_in(&grav, None).unwrap();
+    assert_eq!(n, 200);
+    assert!((whole[1] - 0.5).abs() < 1e-9 && (whole[2] - 0.5).abs() < 1e-9);
+
+    // --ss 12 --duration 5 sits wholly in the second half, measured from the
+    // first sample rather than from the GPMF's absolute 1098 s.
+    let (seg, n) = render::mean_gravity_in(&grav, Some((12.0, Some(5.0)))).unwrap();
+    assert_eq!(n, 50);
+    assert_eq!(seg, [0.0, 0.0, 1.0]);
+    // --ss alone runs to the end.
+    let (_, n) = render::mean_gravity_in(&grav, Some((15.0, None))).unwrap();
+    assert_eq!(n, 50);
+    // A segment past the end has nothing to level by, and says so.
+    assert!(render::mean_gravity_in(&grav, Some((100.0, Some(1.0)))).is_err());
 }
 
 // ---------------------------------------------------------- real material
@@ -271,7 +422,7 @@ fn inspects_the_reference_clip() {
 #[test]
 fn levels_the_reference_clip_from_its_own_gravity() {
     let path = fixture_or_skip!(common::REFERENCE_360);
-    let (mean, n) = render::mean_gravity(&path).unwrap();
+    let (mean, n) = render::mean_gravity(&path, None).unwrap();
     assert_eq!(n, 46080, "one gravity sample per video frame");
 
     // The mean of unit vectors is shorter than one, and by a useful amount: it

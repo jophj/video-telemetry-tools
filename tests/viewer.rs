@@ -171,3 +171,113 @@ accel_total_g,gps_dop,imu_temp_c,gps_valid\n";
     // The rate is still measured correctly from the same column.
     assert!((v["hz"].as_f64().unwrap() - 29.9).abs() < 1.0, "hz {}", v["hz"]);
 }
+
+#[test]
+fn only_this_servers_own_name_is_accepted_as_host() {
+    use gmax::viewer::host_allowed;
+    for ok in ["127.0.0.1:8360", "localhost:8360", "LOCALHOST:8360", "[::1]:8360"] {
+        assert!(host_allowed(Some(ok), 8360), "{ok} was refused");
+    }
+    // A rebinding page arrives under its own name, or the right name on the
+    // wrong port; and a request without a Host is not a browser's.
+    for bad in ["evil.example:8360", "127.0.0.1:80", "localhost", "127.0.0.1.evil:8360", ""] {
+        assert!(!host_allowed(Some(bad), 8360), "{bad} was accepted");
+    }
+    assert!(!host_allowed(None, 8360));
+}
+
+/// The viewer running as a real process, killed when the test ends.
+struct Viewer(std::process::Child);
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn binary() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().expect("test binary path");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join(if cfg!(windows) { "gmax.exe" } else { "gmax" })
+}
+
+/// Send one raw request and return the whole response, or `None` on timeout.
+fn get(port: u16, path: &str, host: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").ok()?;
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).ok()?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[test]
+fn a_stalled_video_download_does_not_block_the_page() {
+    let dir = std::env::temp_dir().join(format!("gmax-viewer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Far larger than any socket buffer, so a whole-file response that nobody
+    // reads blocks its writer.
+    let video = dir.join("big.mp4");
+    std::fs::write(&video, vec![0u8; 32 << 20]).unwrap();
+    let csv = dir.join("big.telemetry.csv");
+    std::fs::write(
+        &csv,
+        "time_s,utc,lean_deg\n0.000,2026-09-08T11:06:47.103Z,1.0\n0.033,2026-09-08T11:06:47.136Z,2.0\n",
+    )
+    .unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _viewer = Viewer(
+        std::process::Command::new(binary())
+            .args(["viewer", video.to_str().unwrap(), "--no-open", "--port", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("run gmax viewer"),
+    );
+    let host = format!("127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while get(port, "/info.json", &host).is_none() {
+        assert!(std::time::Instant::now() < deadline, "the viewer never came up");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Ask for the whole video and never read a byte of it.
+    use std::io::Write;
+    let mut stalled = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(stalled, "GET /video HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let telemetry = get(port, "/telemetry.json", &host).expect("telemetry blocked by the stall");
+    assert!(telemetry.starts_with("HTTP/1.1 200"), "{telemetry}");
+    let info = get(port, "/info.json", &host).expect("info blocked by the stall");
+    // The caption names the CSV when the telemetry carries no clip name.
+    assert!(info.contains("\"telemetry\":\"big.telemetry.csv\""), "{info}");
+
+    // And a page arriving under another name is turned away.
+    let rebound = get(port, "/telemetry.json", &format!("evil.example:{port}")).unwrap();
+    assert!(rebound.starts_with("HTTP/1.1 403"), "{rebound}");
+
+    drop(stalled);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_viewer_caption_is_built_without_inner_html() {
+    // The clip name is a file name, and a file can be named like markup.
+    let html = include_str!("../assets/viewer.html");
+    assert!(!html.contains("el('note').innerHTML"), "the caption is parsed as HTML again");
+    assert!(html.contains("function renderNote("));
+    // The frame step follows the video rather than assuming 29.97.
+    assert!(html.contains("FRAME = 1 / info.fps"));
+}
