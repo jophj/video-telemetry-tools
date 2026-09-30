@@ -23,7 +23,7 @@
 //!   * a malformed payload is reported. The prototype breaks out of its loop on
 //!     an unexpected key, silently truncating the rest of the recording.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::fourcc::FourCc;
 
@@ -46,6 +46,10 @@ pub enum GpmfError {
         claimed: usize,
         available: usize,
     },
+    #[error(
+        "payload {payload} at byte {offset}: data follows the zero padding that should end it"
+    )]
+    DataAfterPadding { payload: usize, offset: usize },
     #[error("payload {payload}: expected a DEVC container, found {found}")]
     ExpectedDevc { payload: usize, found: FourCc },
     #[error("no GPMF payloads found")]
@@ -96,9 +100,13 @@ impl<'a> Iterator for KlvIter<'a> {
     type Item = Klv<'a>;
 
     fn next(&mut self) -> Option<Klv<'a>> {
+        // `off` can sit past the end: the last element's padding is implied,
+        // not always written, so rounding up from an unpadded final element
+        // overshoots. `get` treats that as the clean end it is.
+        let rest = self.buf.get(self.off..).unwrap_or(&[]);
         // A trailing run of padding zeros is normal, not an error.
-        if self.off + 8 > self.buf.len() {
-            if self.buf[self.off..].iter().any(|&b| b != 0) {
+        if rest.len() < 8 {
+            if rest.iter().any(|&b| b != 0) {
                 self.error = Some(GpmfError::TruncatedHeader {
                     payload: self.payload,
                     offset: self.off,
@@ -106,9 +114,18 @@ impl<'a> Iterator for KlvIter<'a> {
             }
             return None;
         }
-        let key = FourCc::from_slice(&self.buf[self.off..self.off + 4]);
+        let key = FourCc::from_slice(&rest[..4]);
         if key == FourCc::ZERO {
-            return None; // padding
+            // Padding, which runs to the end. Anything non-zero after it is a
+            // corrupt key rather than padding, and would otherwise vanish
+            // without a word along with everything behind it.
+            if let Some(i) = rest.iter().position(|&b| b != 0) {
+                self.error = Some(GpmfError::DataAfterPadding {
+                    payload: self.payload,
+                    offset: self.off + i,
+                });
+            }
+            return None;
         }
         let kind = self.buf[self.off + 4];
         let sample_size = self.buf[self.off + 5] as usize;
@@ -126,7 +143,7 @@ impl<'a> Iterator for KlvIter<'a> {
         }
         let data = &self.buf[start..start + dlen];
         // Every payload is padded to a four-byte boundary.
-        self.off = start + ((dlen + 3) / 4) * 4;
+        self.off = start + dlen.div_ceil(4) * 4;
         Some(Klv {
             key,
             kind,
@@ -170,11 +187,7 @@ pub struct StreamChunk {
 
 impl StreamChunk {
     pub fn len(&self) -> usize {
-        if self.components == 0 {
-            0
-        } else {
-            self.values.len() / self.components
-        }
+        self.values.len().checked_div(self.components).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -222,16 +235,17 @@ impl Gpmf {
     pub fn parse(data: &[u8], payload_spans: &[(usize, usize, f64, f64)]) -> Result<Self> {
         let mut payloads = Vec::with_capacity(payload_spans.len());
         let mut warnings = Vec::new();
+        let mut context = StreamContext::default();
 
         for (index, &(start, len, time, duration)) in payload_spans.iter().enumerate() {
-            let end = (start + len).min(data.len());
+            let end = start.saturating_add(len).min(data.len());
             if start >= end {
                 continue;
             }
             let buf = &data[start..end];
             let mut devices = Vec::new();
             let mut iter = KlvIter::new(buf, index);
-            while let Some(klv) = iter.next() {
+            for klv in iter.by_ref() {
                 if klv.key.as_bytes() != b"DEVC" {
                     // Not fatal: note it and keep reading this payload.
                     warnings.push(
@@ -243,7 +257,7 @@ impl Gpmf {
                     );
                     continue;
                 }
-                devices.push(parse_devc(klv.data, index, &mut warnings));
+                devices.push(parse_devc(klv.data, index, &mut context, &mut warnings));
             }
             if let Some(err) = iter.error {
                 warnings.push(err.to_string());
@@ -269,6 +283,7 @@ impl Gpmf {
     /// `(device id, key)`.
     pub fn series(&self) -> BTreeMap<(u32, FourCc), Series> {
         let mut out: BTreeMap<(u32, FourCc), Series> = BTreeMap::new();
+        let mut spans: BTreeMap<(u32, FourCc), Vec<ChunkSpan>> = BTreeMap::new();
         for payload in &self.payloads {
             for device in &payload.devices {
                 for chunk in &device.streams {
@@ -304,22 +319,22 @@ impl Gpmf {
                     if n == 0 {
                         continue;
                     }
-
-                    // Time each sample from this chunk's own STMP where the
-                    // camera provided one, spreading samples evenly across the
-                    // payload otherwise.
-                    let t0 = chunk
-                        .stmp
-                        .map(|us| us as f64 / 1e6)
-                        .unwrap_or(payload.time);
-                    let step = if payload.duration > 0.0 {
-                        payload.duration / n as f64
-                    } else {
-                        0.0
-                    };
-                    for i in 0..n {
-                        entry.times.push(t0 + i as f64 * step);
+                    // Values are flattened, so one chunk of a different width
+                    // would shift every later sample onto the wrong fields.
+                    // `parse` has already warned about it.
+                    if chunk.components != entry.components {
+                        continue;
                     }
+
+                    spans
+                        .entry((device.id, chunk.key))
+                        .or_default()
+                        .push(ChunkSpan {
+                            stmp: chunk.stmp.map(|us| us as f64 / 1e6),
+                            payload_time: payload.time,
+                            payload_duration: payload.duration,
+                            len: n,
+                        });
                     entry.values.extend_from_slice(&chunk.values);
                     if let Some(t) = chunk.tmpc {
                         entry.tmpc.push(t);
@@ -328,15 +343,96 @@ impl Gpmf {
             }
         }
 
-        // STMP anchors each chunk but the within-chunk step was a guess from
-        // the nominal payload duration. Now that neighbouring chunk anchors are
-        // known, re-space each chunk against the next one's start so the
-        // series is monotonic and drift-free.
-        for series in out.values_mut() {
-            series.respace();
+        for (key, series) in out.iter_mut() {
+            if let Some(spans) = spans.get(key) {
+                series.times = lay_out_times(spans);
+            }
         }
         out
     }
+}
+
+/// Where one chunk's samples sit, before they are given times.
+struct ChunkSpan {
+    /// `STMP` in seconds, when the chunk carried one.
+    stmp: Option<f64>,
+    payload_time: f64,
+    payload_duration: f64,
+    len: usize,
+}
+
+/// Give every sample of a series a time.
+///
+/// Each chunk starts at its own `STMP` anchor, and a chunk without one is put
+/// on the same clock by carrying over the offset between `STMP` and container
+/// time from the nearest chunk that had one — mixing the two clocks raw would
+/// jump by however far apart they are. Within a chunk, samples are spread at
+/// the nominal payload duration over the sample count, and that estimate can
+/// overshoot the next chunk's anchor: a 200 Hz sensor does not deliver exactly
+/// 200.2 samples every 1.001 s. Where it would, the chunk is rescaled to end
+/// one sample short of the next anchor, so the series is monotonic and evenly
+/// spaced rather than bunched against the boundary.
+///
+/// `STMP` is taken as an absolute position on the timeline, not re-based to
+/// the first payload. That is deliberate: a clip stream-copied out of a
+/// recording keeps its parent's `STMP` values while its container clock
+/// restarts at zero, and matching the two sample for sample is what lets a
+/// clip borrow its parent's calibration (see `telemetry::timeline`). The cost
+/// is that a file whose camera does not reset `STMP` per file — a continuation
+/// chapter, `GS02…`, is expected to be one — has a timeline that does not
+/// start near zero. Everything downstream measures from `times[0]`, which is
+/// what keeps that harmless.
+fn lay_out_times(spans: &[ChunkSpan]) -> Vec<f64> {
+    // The STMP-minus-container-time offset to put each chunk on the STMP
+    // clock: its own where it has one, else the last seen, else the first
+    // one to come. With no STMP anywhere this is zero and container time is
+    // the clock.
+    let first_offset = spans
+        .iter()
+        .find_map(|s| s.stmp.map(|t| t - s.payload_time))
+        .unwrap_or(0.0);
+    let mut offset = first_offset;
+    let anchors: Vec<f64> = spans
+        .iter()
+        .map(|s| match s.stmp {
+            Some(t) => {
+                offset = t - s.payload_time;
+                t
+            }
+            None => s.payload_time + offset,
+        })
+        .collect();
+
+    let mut times = Vec::with_capacity(spans.iter().map(|s| s.len).sum());
+    for (k, span) in spans.iter().enumerate() {
+        let n = span.len as f64;
+        let t0 = anchors[k];
+        let mut step = if span.payload_duration > 0.0 {
+            span.payload_duration / n
+        } else {
+            0.0
+        };
+        if let Some(&next) = anchors.get(k + 1) {
+            // The tolerance keeps float noise in exactly-fitting chunks, such
+            // as the frame-rate streams, from rescaling them by a hair.
+            if next > t0 && (step == 0.0 || t0 + n * step > next + 1e-9) {
+                step = (next - t0) / n;
+            }
+        }
+        for i in 0..span.len {
+            times.push(t0 + i as f64 * step);
+        }
+    }
+
+    // An anchor that goes backwards cannot be rescaled around. Nudge past
+    // the previous sample by a hair rather than reordering; a duplicated
+    // instant breaks interpolation.
+    for i in 1..times.len() {
+        if times[i] <= times[i - 1] {
+            times[i] = times[i - 1] + 1e-9;
+        }
+    }
+    times
 }
 
 /// One key's samples across the whole recording, on a real time base.
@@ -382,34 +478,55 @@ impl Series {
         }
         Some((self.times.len() - 1) as f64 / span)
     }
+}
 
-    /// Force the time base monotonically increasing.
-    ///
-    /// Successive `STMP` anchors are exact, but the spacing *within* a chunk was
-    /// estimated from the nominal payload duration, which can overshoot the
-    /// next anchor. Rescaling each run to land just short of the following
-    /// anchor keeps the series monotonic without discarding the anchors.
-    fn respace(&mut self) {
-        let n = self.times.len();
-        if n < 2 {
-            return;
-        }
-        for i in 1..n {
-            if self.times[i] <= self.times[i - 1] {
-                // Nudge past the previous sample by a hair rather than
-                // reordering; a duplicated instant breaks interpolation.
-                self.times[i] = self.times[i - 1] + f64::EPSILON.max(1e-9);
-            }
+/// What one payload's streams leave for the next.
+///
+/// `SCAL` and `TYPE` describe a stream, not a payload, and a camera is free to
+/// send them only when they change. Each payload is decoded against the last
+/// ones seen for its `(device, key)`, or a later payload that omits them would
+/// come out unscaled, or — for a struct with no layout — not at all.
+#[derive(Default)]
+struct StreamContext {
+    streams: BTreeMap<(u32, FourCc), StreamState>,
+    /// Warnings already given, so a fault repeated in every payload of a long
+    /// recording is reported once rather than fifteen hundred times.
+    warned: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct StreamState {
+    scal: Vec<f64>,
+    type_str: Option<String>,
+    /// Components per sample, fixed by the first chunk that had any.
+    components: usize,
+}
+
+impl StreamContext {
+    fn warn_once(&mut self, warning: String, warnings: &mut Vec<String>) {
+        self.warn_once_as(warning.clone(), warning, warnings);
+    }
+
+    /// Warn unless a warning with the same `gist` was already given, for
+    /// messages that name the payload they were first seen in.
+    fn warn_once_as(&mut self, gist: String, warning: String, warnings: &mut Vec<String>) {
+        if self.warned.insert(gist) {
+            warnings.push(warning);
         }
     }
 }
 
-fn parse_devc(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Device {
+fn parse_devc(
+    buf: &[u8],
+    payload: usize,
+    context: &mut StreamContext,
+    warnings: &mut Vec<String>,
+) -> Device {
     let mut id = 0u32;
     let mut name = None;
     let mut streams = Vec::new();
     let mut iter = KlvIter::new(buf, payload);
-    while let Some(klv) = iter.next() {
+    for klv in iter.by_ref() {
         match klv.key.as_bytes() {
             b"DVID" => {
                 if klv.data.len() >= 4 {
@@ -418,7 +535,7 @@ fn parse_devc(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Device 
             }
             b"DVNM" => name = Some(decode_text(klv.data)),
             b"STRM" => {
-                if let Some(chunk) = parse_strm(klv.data, payload, warnings) {
+                if let Some(chunk) = parse_strm(klv.data, payload, id, context, warnings) {
                     streams.push(chunk);
                 }
             }
@@ -431,7 +548,13 @@ fn parse_devc(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Device 
     Device { id, name, streams }
 }
 
-fn parse_strm(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Option<StreamChunk> {
+fn parse_strm(
+    buf: &[u8],
+    payload: usize,
+    device: u32,
+    context: &mut StreamContext,
+    warnings: &mut Vec<String>,
+) -> Option<StreamChunk> {
     let mut name = None;
     let mut orin = None;
     let mut units: Vec<String> = Vec::new();
@@ -445,7 +568,7 @@ fn parse_strm(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Option<
     let mut data: Option<(FourCc, u8, usize, usize, Vec<u8>)> = None;
 
     let mut iter = KlvIter::new(buf, payload);
-    while let Some(klv) = iter.next() {
+    for klv in iter.by_ref() {
         match klv.key.as_bytes() {
             b"STNM" => name = Some(decode_text(klv.data)),
             b"ORIN" => orin = Some(decode_text(klv.data)),
@@ -512,10 +635,37 @@ fn parse_strm(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Option<
 
     let (key, kind, sample_size, repeat, raw) = data?;
 
+    // Fill in what this payload left out from what the stream said before,
+    // and remember what it did say for the payloads after.
+    let state = context.streams.entry((device, key)).or_default();
+    if scal.is_empty() {
+        scal = state.scal.clone();
+    } else {
+        state.scal = scal.clone();
+    }
+    match &type_str {
+        None => type_str = state.type_str.clone(),
+        Some(t) => state.type_str = Some(t.clone()),
+    }
+
     let (components, mut values, text) = if kind == b'?' {
-        let layout = type_str.as_deref().unwrap_or("");
-        let (c, v) = decode_struct(layout, sample_size, repeat, &raw);
-        (c, v, Vec::new())
+        match type_str
+            .as_deref()
+            .map(|layout| decode_struct(layout, sample_size, repeat, &raw))
+        {
+            Some(Ok((c, v))) => (c, v, Vec::new()),
+            Some(Err(why)) => {
+                context.warn_once(format!("{key}: {why}; its samples are skipped"), warnings);
+                (0, Vec::new(), Vec::new())
+            }
+            None => {
+                context.warn_once(
+                    format!("{key}: a struct with no TYPE layout; its samples are skipped"),
+                    warnings,
+                );
+                (0, Vec::new(), Vec::new())
+            }
+        }
     } else if matches!(kind, b'c' | b'F' | b'U') {
         let text = (0..repeat)
             .filter_map(|i| {
@@ -530,6 +680,23 @@ fn parse_strm(buf: &[u8], payload: usize, warnings: &mut Vec<String>) -> Option<
     };
 
     apply_scal(&mut values, components, &scal);
+
+    // Series are flattened, so a change of width mid-recording cannot be
+    // followed. The first width seen wins and `Gpmf::series` drops the rest.
+    let state = context.streams.entry((device, key)).or_default();
+    if state.components == 0 {
+        state.components = components;
+    } else if components != 0 && components != state.components {
+        let established = state.components;
+        context.warn_once_as(
+            format!("{key} width {components} after {established}"),
+            format!(
+                "{key}: from payload {payload}, some chunks have {components} values per sample \
+                 where the first had {established}; they are skipped"
+            ),
+            warnings,
+        );
+    }
 
     Some(StreamChunk {
         key,
@@ -580,8 +747,8 @@ fn type_width(kind: u8) -> Option<usize> {
     Some(match kind {
         b'b' | b'B' => 1,
         b's' | b'S' => 2,
-        b'l' | b'L' | b'f' => 4,
-        b'd' | b'j' | b'J' => 8,
+        b'l' | b'L' | b'f' | b'q' => 4,
+        b'd' | b'j' | b'J' | b'Q' => 8,
         _ => return None,
     })
 }
@@ -598,6 +765,12 @@ fn read_one(kind: u8, b: &[u8]) -> f64 {
         b'd' => f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
         b'j' => i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64,
         b'J' => u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64,
+        // Signed fixed point: Q15.16 and Q31.32.
+        b'q' => i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64 / 65_536.0,
+        b'Q' => {
+            i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+                / 4_294_967_296.0
+        }
         _ => f64::NAN,
     }
 }
@@ -619,7 +792,12 @@ fn decode_numeric(kind: u8, sample_size: usize, repeat: usize, data: &[u8]) -> (
             let s = base + c * w;
             match data.get(s..s + w) {
                 Some(b) => out.push(read_one(kind, b)),
-                None => return (components, out),
+                None => {
+                    // Keep whole samples only, or the partial one would shift
+                    // every sample appended after it.
+                    out.truncate(out.len() / components * components);
+                    return (components, out);
+                }
             }
         }
     }
@@ -629,30 +807,101 @@ fn decode_numeric(kind: u8, sample_size: usize, repeat: usize, data: &[u8]) -> (
 /// Decode a `?`-typed struct against its `TYPE` layout string.
 ///
 /// `GPS9` is the reason this exists: its layout is `lllllllSS`, seven `i32`
-/// then two `u16`, 32 bytes per sample.
-fn decode_struct(layout: &str, sample_size: usize, repeat: usize, data: &[u8]) -> (usize, Vec<f64>) {
-    let fields: Vec<u8> = layout
-        .bytes()
-        .filter(|&b| type_width(b).is_some())
-        .collect();
-    if fields.is_empty() {
-        return (0, Vec::new());
+/// then two `u16`, 32 bytes per sample. Only numeric fields become
+/// components, but every field takes up room, so text fields (`c`, `F`, `G`,
+/// `U`) are stepped over rather than ignored, and `f[4]` counts as four `f`.
+/// Ignoring either would read every later field from the wrong offset.
+fn decode_struct(
+    layout: &str,
+    sample_size: usize,
+    repeat: usize,
+    data: &[u8],
+) -> std::result::Result<(usize, Vec<f64>), String> {
+    let fields = parse_layout(layout, sample_size)?;
+    let components = fields.iter().filter(|f| f.numeric).count();
+    if components == 0 {
+        return Ok((0, Vec::new()));
     }
-    let components = fields.len();
     let mut out = Vec::with_capacity(components * repeat);
     for r in 0..repeat {
-        let base = r * sample_size;
-        let mut off = base;
-        for &f in &fields {
-            let w = type_width(f).unwrap();
-            match data.get(off..off + w) {
-                Some(b) => out.push(read_one(f, b)),
-                None => return (components, out),
+        let mut off = r * sample_size;
+        let before = out.len();
+        for f in &fields {
+            if f.numeric {
+                match data.get(off..off + f.width) {
+                    Some(b) => out.push(read_one(f.kind, b)),
+                    None => {
+                        out.truncate(before);
+                        return Ok((components, out));
+                    }
+                }
             }
-            off += w;
+            off += f.width;
         }
     }
-    (components, out)
+    Ok((components, out))
+}
+
+/// One field of a `TYPE` layout, after array notation has been expanded.
+struct Field {
+    kind: u8,
+    width: usize,
+    numeric: bool,
+}
+
+/// Expand a layout into its fields, refusing one wider than `sample_size`.
+///
+/// The width check is made as the layout is read, not after: it is what keeps
+/// a corrupt `f[65535]…` from expanding into billions of fields, and a layout
+/// that does not fit would take each sample's tail from the next sample.
+fn parse_layout(layout: &str, sample_size: usize) -> std::result::Result<Vec<Field>, String> {
+    let bytes = layout.as_bytes();
+    let mut fields = Vec::new();
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let kind = bytes[i];
+        i += 1;
+        let (width, numeric) = match (type_width(kind), kind) {
+            (Some(w), _) => (w, true),
+            (None, b'c') => (1, false),
+            (None, b'F') => (4, false),
+            (None, b'G' | b'U') => (16, false),
+            _ => {
+                return Err(format!(
+                    "TYPE {layout:?} has a field of unknown type {:?}",
+                    kind as char
+                ))
+            }
+        };
+        let mut count = 1usize;
+        if bytes.get(i) == Some(&b'[') {
+            let close = bytes[i..]
+                .iter()
+                .position(|&b| b == b']')
+                .ok_or_else(|| format!("TYPE {layout:?} has an unclosed ["))?;
+            count = std::str::from_utf8(&bytes[i + 1..i + close])
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|&n| n <= u16::MAX as usize)
+                .ok_or_else(|| format!("TYPE {layout:?} has a bad repeat count"))?;
+            i += close + 1;
+        }
+        total = total.saturating_add(width.saturating_mul(count));
+        if total > sample_size {
+            return Err(format!(
+                "TYPE {layout:?} describes samples wider than their {sample_size} bytes"
+            ));
+        }
+        for _ in 0..count {
+            fields.push(Field {
+                kind,
+                width,
+                numeric,
+            });
+        }
+    }
+    Ok(fields)
 }
 
 /// GPMF strings are fixed-width, null-padded and **Latin-1**, not UTF-8.
@@ -673,10 +922,7 @@ fn decode_text(b: &[u8]) -> String {
 /// `ORIN` names the source axis for each output axis in order; a lowercase
 /// letter negates it. `ACCL` and `GYRO` on this camera are tagged `ZXY`.
 pub fn reorient(sample: &[f64], orin: Option<&str>) -> [f64; 3] {
-    let mut v = [0.0f64; 3];
-    for i in 0..3 {
-        v[i] = sample.get(i).copied().unwrap_or(0.0);
-    }
+    let v: [f64; 3] = std::array::from_fn(|i| sample.get(i).copied().unwrap_or(0.0));
     let Some(orin) = orin else { return v };
     let bytes = orin.as_bytes();
     if bytes.len() < 3 {
@@ -724,9 +970,17 @@ pub fn to_grav_frame(sample: &[f64], orin: Option<&str>) -> [f64; 3] {
 pub fn from_mp4(file: &mut crate::mp4::Mp4) -> anyhow::Result<Gpmf> {
     use anyhow::Context;
 
-    let track = file
-        .gpmd_track()
-        .context("file has no GPMF (gpmd) telemetry track")?;
+    let Some(track) = file.gpmd_track() else {
+        // A track skipped as unreadable is the likely reason, so say so.
+        let mut msg = "file has no GPMF (gpmd) telemetry track".to_string();
+        for w in &file.warnings {
+            msg.push_str("; ");
+            msg.push_str(w);
+        }
+        anyhow::bail!(msg);
+    };
+    let mut warnings = file.warnings.clone();
+    let edits = (!track.edit_list_is_trivial()).then(|| track.edits.clone());
     let track_id = track.id;
     let timescale = track.timescale.max(1) as f64;
     let mut spans = Vec::with_capacity(track.samples.len());
@@ -738,9 +992,31 @@ pub fn from_mp4(file: &mut crate::mp4::Mp4) -> anyhow::Result<Gpmf> {
             s.dts as f64 / timescale,
             f64::from(s.duration) / timescale,
         ));
-        cursor += s.size as usize;
+        cursor = cursor.saturating_add(s.size as usize);
     }
 
-    let data = file.read_track_data(track_id)?;
-    Ok(Gpmf::parse(&data, &spans)?)
+    let data = file
+        .read_track_data(track_id)
+        .context("reading the telemetry track")?;
+    let mut gpmf = Gpmf::parse(&data, &spans)?;
+    // Payload times come straight from the sample table, which ignores edits.
+    // They only time samples that lack an STMP, so an edit list matters only
+    // then — and a stream-copied clip, which always has one, has STMP
+    // throughout. It is reported rather than applied, because applying one
+    // wrongly would shift timestamps that are right.
+    let unstamped = gpmf
+        .payloads
+        .iter()
+        .flat_map(|p| &p.devices)
+        .flat_map(|d| &d.streams)
+        .any(|c| c.stmp.is_none());
+    if let (Some(edits), true) = (edits, unstamped) {
+        warnings.push(format!(
+            "the telemetry track has an edit list ({edits:?}) that is not applied, and some samples \
+             carry no STMP, so their times ignore it"
+        ));
+    }
+    warnings.append(&mut gpmf.warnings);
+    gpmf.warnings = warnings;
+    Ok(gpmf)
 }

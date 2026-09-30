@@ -38,6 +38,21 @@ pub enum Mp4Error {
     NoMoov { path: PathBuf },
     #[error("{path}: moov box is {size} bytes, refusing to read it")]
     MoovTooLarge { path: PathBuf, size: u64 },
+    #[error("{path}: box at byte {offset} declares a size of {size}, smaller than its own header")]
+    BadBoxSize {
+        path: PathBuf,
+        offset: u64,
+        size: u32,
+    },
+    #[error("corrupt {what} box: {reason}")]
+    Corrupt { what: &'static str, reason: String },
+    #[error("{path}: a sample at byte {offset} of {size} bytes runs past the end of the {file_len}-byte file")]
+    SampleOutOfRange {
+        path: PathBuf,
+        offset: u64,
+        size: u32,
+        file_len: u64,
+    },
     #[error("truncated {what} box: wanted {wanted} bytes, {have} available")]
     TruncatedBox {
         what: &'static str,
@@ -84,6 +99,20 @@ pub struct Track {
     pub width: u32,
     pub height: u32,
     pub samples: Vec<Sample>,
+    /// The `edts/elst` edit list, empty when the track has none.
+    pub edits: Vec<Edit>,
+}
+
+/// One `elst` entry: a span of the movie timeline and where in the media it
+/// comes from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Edit {
+    /// Length of this span, in the *movie* timescale.
+    pub segment_duration: u64,
+    /// Start of the span in the track's media timescale, or -1 for an empty
+    /// edit: a gap in which the track presents nothing.
+    pub media_time: i64,
+    pub media_rate: f64,
 }
 
 impl Track {
@@ -115,11 +144,26 @@ impl Track {
     pub fn total_bytes(&self) -> u64 {
         self.samples.iter().map(|s| u64::from(s.size)).sum()
     }
+
+    /// True when the edit list, if any, presents the media exactly as its
+    /// sample table lays it out.
+    ///
+    /// Sample times in [`Sample::dts`] ignore edits, so any other list means
+    /// those times are not presentation times: an empty edit delays the whole
+    /// track, and a non-zero `media_time` skips its start.
+    pub fn edit_list_is_trivial(&self) -> bool {
+        match self.edits.as_slice() {
+            [] => true,
+            [only] => only.media_time == 0 && only.media_rate == 1.0,
+            _ => false,
+        }
+    }
 }
 
 pub struct Mp4 {
     path: PathBuf,
     file: File,
+    file_len: u64,
     pub tracks: Vec<Track>,
     /// `mvhd` creation time, as a Unix timestamp. GoPro writes local wall clock
     /// here on some models, so it is a fallback clock only.
@@ -130,6 +174,9 @@ pub struct Mp4 {
     pub major_brand: Option<FourCc>,
     /// Flat `udta` string values, keyed by box type (`FIRM`, `MINF`, …).
     pub udta: HashMap<FourCc, Vec<u8>>,
+    /// Non-fatal problems met while reading the container, e.g. a track that
+    /// was skipped because its sample table did not make sense.
+    pub warnings: Vec<String>,
 }
 
 impl Mp4 {
@@ -153,15 +200,30 @@ impl Mp4 {
             })?
             .len();
 
+        let mut warnings = Vec::new();
+
         // Walk only the top level; `moov` may sit after an 8 GB `mdat`.
         while cursor < file_len {
-            let Some(header) = read_box_header(&mut reader, cursor, file_len, &path)? else {
-                break;
+            let header = match read_box_header(&mut reader, cursor, file_len, &path) {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                // Garbage after a moov already in hand costs nothing we need,
+                // so it is reported rather than fatal. Before one, it is the
+                // real reason the moov is missing and must say so, not leave
+                // the caller with a misleading "no moov box".
+                Err(e @ Mp4Error::BadBoxSize { .. }) if moov.is_some() => {
+                    warnings.push(format!("{e}; ignoring the rest of the file"));
+                    break;
+                }
+                Err(e) => return Err(e),
             };
             saw_top_level_box = true;
             match header.kind.as_bytes() {
                 b"ftyp" => {
-                    let body = read_exact_vec(&mut reader, header.body_len(), &path)?;
+                    // Only the major brand is wanted. A real ftyp is a few
+                    // dozen bytes, and reading no more than the brand keeps a
+                    // corrupt size from becoming a huge allocation.
+                    let body = read_exact_vec(&mut reader, header.body_len().min(4), &path)?;
                     if body.len() >= 4 {
                         major_brand = Some(FourCc::from_slice(&body[..4]));
                     }
@@ -198,12 +260,14 @@ impl Mp4 {
         let mut mp4 = Mp4 {
             path,
             file,
+            file_len,
             tracks: Vec::new(),
             creation_time: None,
             timescale: 0,
             duration: 0,
             major_brand,
             udta: HashMap::new(),
+            warnings,
         };
         mp4.parse_moov(&moov)?;
         Ok(mp4)
@@ -247,11 +311,23 @@ impl Mp4 {
             Some(t) => t.samples.clone(),
             None => return Ok(Vec::new()),
         };
-        let total: usize = samples
-            .iter()
-            .map(|s| s.size as usize)
-            .fold(0usize, |a, b| a.saturating_add(b));
-        let mut out = Vec::with_capacity(total);
+        // Every size here came from the file, so check them all against it
+        // before allocating anything: a corrupt table must not be able to ask
+        // for more memory than the file has bytes.
+        for s in &samples {
+            self.check_in_file(s)?;
+        }
+        let total: u64 = samples.iter().map(|s| u64::from(s.size)).sum();
+        if total > self.file_len {
+            return Err(Mp4Error::Corrupt {
+                what: "stsz",
+                reason: format!(
+                    "track {track_id}'s samples add up to {total} bytes, more than the {}-byte file",
+                    self.file_len
+                ),
+            });
+        }
+        let mut out = Vec::with_capacity(total as usize);
         let mut buf = Vec::new();
         for s in &samples {
             self.file
@@ -272,7 +348,20 @@ impl Mp4 {
         Ok(out)
     }
 
+    fn check_in_file(&self, sample: &Sample) -> Result<()> {
+        match sample.offset.checked_add(u64::from(sample.size)) {
+            Some(end) if end <= self.file_len => Ok(()),
+            _ => Err(Mp4Error::SampleOutOfRange {
+                path: self.path.clone(),
+                offset: sample.offset,
+                size: sample.size,
+                file_len: self.file_len,
+            }),
+        }
+    }
+
     pub fn read_sample(&mut self, sample: &Sample) -> Result<Vec<u8>> {
+        self.check_in_file(sample)?;
         self.file
             .seek(SeekFrom::Start(sample.offset))
             .map_err(|source| Mp4Error::Io {
@@ -290,7 +379,8 @@ impl Mp4 {
     }
 
     fn parse_moov(&mut self, moov: &[u8]) -> Result<()> {
-        for (kind, body) in BoxIter::new(moov) {
+        let mut warnings = Vec::new();
+        for (kind, body) in children(moov, "moov", &mut warnings) {
             match kind.as_bytes() {
                 b"mvhd" => {
                     let (created, timescale, duration) = parse_mvhd(body)?;
@@ -298,85 +388,98 @@ impl Mp4 {
                     self.timescale = timescale;
                     self.duration = duration;
                 }
-                b"trak" => {
-                    if let Some(track) = self.parse_trak(body)? {
-                        self.tracks.push(track);
-                    }
-                }
+                b"trak" => match parse_trak(body, self.file_len, &mut warnings) {
+                    Ok(Some(track)) => self.tracks.push(track),
+                    Ok(None) => {}
+                    // One unreadable track must not cost the others: the
+                    // telemetry track is all most commands want, and it is
+                    // rarely the one that is broken.
+                    Err(e) => warnings.push(format!("skipping a track: {e}")),
+                },
                 b"udta" => {
-                    for (k, v) in BoxIter::new(body) {
+                    for (k, v) in children(body, "udta", &mut warnings) {
                         self.udta.insert(k, v.to_vec());
                     }
                 }
                 _ => {}
             }
         }
+        self.warnings.extend(warnings);
         Ok(())
     }
+}
 
-    fn parse_trak(&self, trak: &[u8]) -> Result<Option<Track>> {
-        let mut id = 0u32;
-        let mut width = 0u32;
-        let mut height = 0u32;
-        let mut handler = FourCc::ZERO;
-        let mut format = FourCc::ZERO;
-        let mut timescale = 0u32;
-        let mut duration = 0u64;
-        let mut stbl: Option<&[u8]> = None;
+fn parse_trak(trak: &[u8], file_len: u64, warnings: &mut Vec<String>) -> Result<Option<Track>> {
+    let mut id = 0u32;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut handler = FourCc::ZERO;
+    let mut format = FourCc::ZERO;
+    let mut timescale = 0u32;
+    let mut duration = 0u64;
+    let mut stbl: Option<&[u8]> = None;
+    let mut edits = Vec::new();
 
-        for (kind, body) in BoxIter::new(trak) {
-            match kind.as_bytes() {
-                b"tkhd" => {
-                    let (tid, w, h) = parse_tkhd(body)?;
-                    id = tid;
-                    width = w;
-                    height = h;
-                }
-                b"mdia" => {
-                    for (k2, b2) in BoxIter::new(body) {
-                        match k2.as_bytes() {
-                            b"mdhd" => {
-                                let (ts, dur) = parse_mdhd(b2)?;
-                                timescale = ts;
-                                duration = dur;
-                            }
-                            b"hdlr" => {
-                                if b2.len() >= 12 {
-                                    handler = FourCc::from_slice(&b2[8..12]);
-                                }
-                            }
-                            b"minf" => {
-                                for (k3, b3) in BoxIter::new(b2) {
-                                    if k3.as_bytes() == b"stbl" {
-                                        stbl = Some(b3);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+    for (kind, body) in children(trak, "trak", warnings) {
+        match kind.as_bytes() {
+            b"tkhd" => {
+                let (tid, w, h) = parse_tkhd(body)?;
+                id = tid;
+                width = w;
+                height = h;
+            }
+            b"edts" => {
+                for (k2, b2) in children(body, "edts", warnings) {
+                    if k2.as_bytes() == b"elst" {
+                        edits = parse_elst(b2)?;
                     }
                 }
-                _ => {}
             }
+            b"mdia" => {
+                for (k2, b2) in children(body, "mdia", warnings) {
+                    match k2.as_bytes() {
+                        b"mdhd" => {
+                            let (ts, dur) = parse_mdhd(b2)?;
+                            timescale = ts;
+                            duration = dur;
+                        }
+                        b"hdlr" => {
+                            if b2.len() >= 12 {
+                                handler = FourCc::from_slice(&b2[8..12]);
+                            }
+                        }
+                        b"minf" => {
+                            for (k3, b3) in children(b2, "minf", warnings) {
+                                if k3.as_bytes() == b"stbl" {
+                                    stbl = Some(b3);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
-
-        let Some(stbl) = stbl else {
-            return Ok(None);
-        };
-        let tables = SampleTables::parse(stbl, &mut format)?;
-        let samples = tables.build(id)?;
-
-        Ok(Some(Track {
-            id,
-            handler,
-            format,
-            timescale,
-            duration,
-            width,
-            height,
-            samples,
-        }))
     }
+
+    let Some(stbl) = stbl else {
+        return Ok(None);
+    };
+    let tables = SampleTables::parse(stbl, &mut format, file_len, warnings)?;
+    let samples = tables.build(id)?;
+
+    Ok(Some(Track {
+        id,
+        handler,
+        format,
+        timescale,
+        duration,
+        width,
+        height,
+        samples,
+        edits,
+    }))
 }
 
 /// The four `stbl` tables needed to locate a sample, kept separate so the
@@ -394,9 +497,14 @@ struct SampleTables {
 }
 
 impl SampleTables {
-    fn parse(stbl: &[u8], format: &mut FourCc) -> Result<Self> {
+    fn parse(
+        stbl: &[u8],
+        format: &mut FourCc,
+        file_len: u64,
+        warnings: &mut Vec<String>,
+    ) -> Result<Self> {
         let mut t = SampleTables::default();
-        for (kind, body) in BoxIter::new(stbl) {
+        for (kind, body) in children(stbl, "stbl", warnings) {
             match kind.as_bytes() {
                 b"stsd" => {
                     // version/flags(4) + entry_count(4), then size(4) + format(4).
@@ -407,8 +515,8 @@ impl SampleTables {
                 b"stts" => {
                     let mut r = Reader::new(body, "stts");
                     r.skip(4)?; // version/flags
-                    let n = r.u32()? as usize;
-                    t.time_to_sample.reserve(n.min(1 << 20));
+                    let n = r.count(8)?;
+                    t.time_to_sample.reserve(n);
                     for _ in 0..n {
                         let count = r.u32()?;
                         let delta = r.u32()?;
@@ -419,11 +527,23 @@ impl SampleTables {
                     let mut r = Reader::new(body, "stsz");
                     r.skip(4)?;
                     let uniform = r.u32()?;
-                    let count = r.u32()? as usize;
                     if uniform != 0 {
-                        t.sizes = vec![uniform; count];
+                        // A uniform size has no table to bound the count, so
+                        // bound it by the file instead: the samples have to
+                        // fit in it.
+                        let count = r.u32()?;
+                        if u64::from(uniform) * u64::from(count) > file_len {
+                            return Err(Mp4Error::Corrupt {
+                                what: "stsz",
+                                reason: format!(
+                                    "{count} samples of {uniform} bytes cannot fit in a {file_len}-byte file"
+                                ),
+                            });
+                        }
+                        t.sizes = vec![uniform; count as usize];
                     } else {
-                        t.sizes.reserve(count.min(1 << 24));
+                        let count = r.count(4)?;
+                        t.sizes.reserve(count);
                         for _ in 0..count {
                             t.sizes.push(r.u32()?);
                         }
@@ -435,7 +555,27 @@ impl SampleTables {
                     r.skip(3)?; // reserved
                     let field_size = r.u8()?;
                     let count = r.u32()? as usize;
-                    t.sizes.reserve(count.min(1 << 24));
+                    let table_bytes = match field_size {
+                        4 => count.div_ceil(2),
+                        8 => count,
+                        16 => count.saturating_mul(2),
+                        // Anything else is not a valid stz2, and guessing a
+                        // width would misplace every sample after the first.
+                        other => {
+                            return Err(Mp4Error::Corrupt {
+                                what: "stz2",
+                                reason: format!("field size {other}, not 4, 8 or 16"),
+                            })
+                        }
+                    };
+                    if table_bytes > r.remaining() {
+                        return Err(Mp4Error::TruncatedBox {
+                            what: "stz2",
+                            wanted: table_bytes,
+                            have: r.remaining(),
+                        });
+                    }
+                    t.sizes.reserve(count);
                     match field_size {
                         4 => {
                             for i in 0..count {
@@ -463,8 +603,8 @@ impl SampleTables {
                 b"stsc" => {
                     let mut r = Reader::new(body, "stsc");
                     r.skip(4)?;
-                    let n = r.u32()? as usize;
-                    t.sample_to_chunk.reserve(n.min(1 << 20));
+                    let n = r.count(12)?;
+                    t.sample_to_chunk.reserve(n);
                     for _ in 0..n {
                         let first_chunk = r.u32()?;
                         let per_chunk = r.u32()?;
@@ -475,8 +615,8 @@ impl SampleTables {
                 b"stco" => {
                     let mut r = Reader::new(body, "stco");
                     r.skip(4)?;
-                    let n = r.u32()? as usize;
-                    t.chunk_offsets.reserve(n.min(1 << 24));
+                    let n = r.count(4)?;
+                    t.chunk_offsets.reserve(n);
                     for _ in 0..n {
                         t.chunk_offsets.push(u64::from(r.u32()?));
                     }
@@ -486,8 +626,8 @@ impl SampleTables {
                     // express its chunk offsets in 32 bits.
                     let mut r = Reader::new(body, "co64");
                     r.skip(4)?;
-                    let n = r.u32()? as usize;
-                    t.chunk_offsets.reserve(n.min(1 << 24));
+                    let n = r.count(8)?;
+                    t.chunk_offsets.reserve(n);
                     for _ in 0..n {
                         t.chunk_offsets.push(r.u64()?);
                     }
@@ -540,8 +680,14 @@ impl SampleTables {
                     break;
                 }
                 let size = self.sizes[sample_idx];
+                let offset = base.checked_add(within).ok_or_else(|| Mp4Error::Corrupt {
+                    what: "stco",
+                    reason: format!(
+                        "track {track_id}: sample {sample_idx} lies past the end of the 64-bit address space"
+                    ),
+                })?;
                 samples.push(Sample {
-                    offset: base + within,
+                    offset,
                     size,
                     dts: 0,
                     duration: 0,
@@ -562,7 +708,7 @@ impl SampleTables {
                 }
                 samples[i].dts = dts;
                 samples[i].duration = delta;
-                dts += u64::from(delta);
+                dts = dts.saturating_add(u64::from(delta));
                 i += 1;
             }
         }
@@ -572,7 +718,7 @@ impl SampleTables {
             while i < samples.len() {
                 samples[i].dts = dts;
                 samples[i].duration = delta;
-                dts += u64::from(delta);
+                dts = dts.saturating_add(u64::from(delta));
                 i += 1;
             }
         }
@@ -627,7 +773,13 @@ fn read_box_header<R: Read + Seek>(
         }
         // `size == 0`: the box runs to end of file.
         0 => (at + 8, file_len),
-        s if u64::from(s) < 8 => return Ok(None),
+        s if u64::from(s) < 8 => {
+            return Err(Mp4Error::BadBoxSize {
+                path: path.to_path_buf(),
+                offset: at,
+                size: s,
+            })
+        }
         s => (at + 8, at + u64::from(s)),
     };
     Ok(Some(BoxHeader {
@@ -637,24 +789,56 @@ fn read_box_header<R: Read + Seek>(
     }))
 }
 
+/// Read exactly `len` bytes, growing the buffer only as bytes arrive.
+///
+/// `len` comes from a box header, so it is only as trustworthy as the file:
+/// allocating it all up front would let a file that lies about its size, or
+/// shrinks while being read, claim memory it never fills.
 fn read_exact_vec<R: Read>(reader: &mut R, len: u64, path: &Path) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len as usize];
-    reader.read_exact(&mut buf).map_err(|source| Mp4Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut buf = Vec::new();
+    reader
+        .take(len)
+        .read_to_end(&mut buf)
+        .map_err(|source| Mp4Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if (buf.len() as u64) < len {
+        return Err(Mp4Error::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("wanted {len} bytes, the file had {}", buf.len()),
+            ),
+        });
+    }
     Ok(buf)
 }
 
 /// Iterates the child boxes of an in-memory container body.
+///
+/// Stops at the first child whose header cannot be read, recording why in
+/// `malformed` so the caller can report it rather than quietly lose every box
+/// after it.
 struct BoxIter<'a> {
     buf: &'a [u8],
     off: usize,
+    malformed: Option<String>,
 }
 
 impl<'a> BoxIter<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        BoxIter { buf, off: 0 }
+        BoxIter {
+            buf,
+            off: 0,
+            malformed: None,
+        }
+    }
+
+    fn stop(&mut self, why: String) -> Option<(FourCc, &'a [u8])> {
+        self.malformed = Some(why);
+        self.off = self.buf.len();
+        None
     }
 }
 
@@ -662,42 +846,74 @@ impl<'a> Iterator for BoxIter<'a> {
     type Item = (FourCc, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.off + 8 <= self.buf.len() {
-            let size32 = u32::from_be_bytes([
-                self.buf[self.off],
-                self.buf[self.off + 1],
-                self.buf[self.off + 2],
-                self.buf[self.off + 3],
-            ]);
-            let kind = FourCc::from_slice(&self.buf[self.off + 4..self.off + 8]);
-            let (body_start, box_end) = match size32 {
-                1 => {
-                    if self.off + 16 > self.buf.len() {
-                        return None;
-                    }
-                    let mut big = [0u8; 8];
-                    big.copy_from_slice(&self.buf[self.off + 8..self.off + 16]);
-                    let size = u64::from_be_bytes(big) as usize;
-                    (self.off + 16, self.off.saturating_add(size.max(16)))
-                }
-                0 => (self.off + 8, self.buf.len()),
-                s if (s as usize) < 8 => return None,
-                s => (self.off + 8, self.off + s as usize),
-            };
-            let box_end = box_end.min(self.buf.len());
-            if body_start > box_end {
-                return None;
+        let at = self.off;
+        let rest = self.buf.len().saturating_sub(at);
+        if rest < 8 {
+            // Up to seven trailing zero bytes are padding some muxers leave;
+            // anything else is a header that was cut short.
+            if self.buf[at.min(self.buf.len())..].iter().any(|&b| b != 0) {
+                return self.stop(format!("{rest} stray bytes at offset {at}"));
             }
-            let body = &self.buf[body_start..box_end];
-            self.off = if box_end > self.off {
-                box_end
-            } else {
-                self.buf.len()
-            };
-            return Some((kind, body));
+            return None;
         }
-        None
+        let size32 = u32::from_be_bytes([
+            self.buf[at],
+            self.buf[at + 1],
+            self.buf[at + 2],
+            self.buf[at + 3],
+        ]);
+        let kind = FourCc::from_slice(&self.buf[at + 4..at + 8]);
+        let (body_start, box_end) = match size32 {
+            1 => {
+                if rest < 16 {
+                    return self.stop(format!("{kind} at offset {at} has a truncated 64-bit size"));
+                }
+                let mut big = [0u8; 8];
+                big.copy_from_slice(&self.buf[at + 8..at + 16]);
+                let size = u64::from_be_bytes(big);
+                if size < 16 {
+                    return self.stop(format!(
+                        "{kind} at offset {at} declares a 64-bit size of {size}"
+                    ));
+                }
+                (
+                    at + 16,
+                    usize::try_from(size).map_or(usize::MAX, |s| at.saturating_add(s)),
+                )
+            }
+            0 => (at + 8, self.buf.len()),
+            s if s < 8 => {
+                return self.stop(format!("{kind} at offset {at} declares a size of {s}"));
+            }
+            s => (at + 8, at.saturating_add(s as usize)),
+        };
+        if box_end > self.buf.len() {
+            // Handed out clamped rather than dropped: the tables inside
+            // report their own truncation, and a box that merely overhangs
+            // its parent is often readable.
+            self.malformed = Some(format!(
+                "{kind} at offset {at} claims {} bytes but only {rest} remain",
+                box_end - at
+            ));
+        }
+        let box_end = box_end.min(self.buf.len());
+        self.off = box_end;
+        Some((kind, &self.buf[body_start..box_end]))
     }
+}
+
+/// The children of a container, with any malformation noted in `warnings`.
+fn children<'a>(
+    buf: &'a [u8],
+    parent: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<(FourCc, &'a [u8])> {
+    let mut iter = BoxIter::new(buf);
+    let out: Vec<_> = iter.by_ref().collect();
+    if let Some(why) = iter.malformed {
+        warnings.push(format!("malformed {parent} box: {why}"));
+    }
+    out
 }
 
 /// Big-endian cursor with bounds errors that name the box they came from.
@@ -712,11 +928,15 @@ impl<'a> Reader<'a> {
         Reader { buf, off: 0, what }
     }
 
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.off
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.off + n > self.buf.len() {
+        if n > self.remaining() {
             return Err(Mp4Error::TruncatedBox {
                 what: self.what,
-                wanted: self.off + n,
+                wanted: self.off.saturating_add(n),
                 have: self.buf.len(),
             });
         }
@@ -741,6 +961,22 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32> {
         let s = self.take(4)?;
         Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    /// An entry count for a table of `entry_size`-byte entries, refused when
+    /// the box is too short to hold that many. It is what bounds every
+    /// allocation made from a table's own claim of its length.
+    fn count(&mut self, entry_size: usize) -> Result<usize> {
+        let n = self.u32()? as usize;
+        let wanted = n.saturating_mul(entry_size);
+        if wanted > self.remaining() {
+            return Err(Mp4Error::TruncatedBox {
+                what: self.what,
+                wanted: self.off.saturating_add(wanted),
+                have: self.buf.len(),
+            });
+        }
+        Ok(n)
     }
 
     fn u64(&mut self) -> Result<u64> {
@@ -768,12 +1004,40 @@ fn parse_mvhd(body: &[u8]) -> Result<(Option<i64>, u32, u64)> {
         let duration = u64::from(r.u32()?);
         (created, timescale, duration)
     };
+    // A version 1 time is 64 bits unsigned; one past i64::MAX is not a date
+    // anyone recorded, so it is treated as absent rather than wrapped.
     let unix = if created == 0 {
         None
     } else {
-        Some(created as i64 - EPOCH_OFFSET_1904)
+        i64::try_from(created)
+            .ok()
+            .and_then(|c| c.checked_sub(EPOCH_OFFSET_1904))
     };
     Ok((unix, timescale, duration))
+}
+
+fn parse_elst(body: &[u8]) -> Result<Vec<Edit>> {
+    let mut r = Reader::new(body, "elst");
+    let version = r.u8()?;
+    r.skip(3)?;
+    let entry_size = if version == 1 { 20 } else { 12 };
+    let n = r.count(entry_size)?;
+    let mut edits = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (segment_duration, media_time) = if version == 1 {
+            (r.u64()?, r.u64()? as i64)
+        } else {
+            (u64::from(r.u32()?), i64::from(r.u32()? as i32))
+        };
+        let whole = r.u16()? as i16;
+        let fraction = r.u16()?;
+        edits.push(Edit {
+            segment_duration,
+            media_time,
+            media_rate: f64::from(whole) + f64::from(fraction) / 65536.0,
+        });
+    }
+    Ok(edits)
 }
 
 fn parse_tkhd(body: &[u8]) -> Result<(u32, u32, u32)> {

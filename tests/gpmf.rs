@@ -207,3 +207,24 @@ fn gpmf_parses_without_warnings() {
         assert_eq!(p.devices[0].name.as_deref(), Some("MAX2"));
     }
 }
+
+#[test]
+fn every_stream_is_evenly_spaced_rather_than_bunched_at_payload_boundaries() {
+    let Some((_f, g)) = open() else {
+        eprintln!("SKIP: fixture {} is not present", common::REFERENCE_360);
+        return;
+    };
+    // The sensors do not deliver a whole number of samples per 1.001 s
+    // payload, so spreading each chunk at the nominal interval runs past the
+    // next chunk's STMP. Those samples used to be nudged a nanosecond apart
+    // against the boundary: 10 such pile-ups in GYRO, 4 in GPS9. Rescaled to
+    // end before the next anchor, no step is less than half the mean.
+    for ((_, key), s) in g.series() {
+        let mean = 1.0 / s.hz().unwrap();
+        let tightest = s.times.windows(2).map(|w| w[1] - w[0]).fold(f64::MAX, f64::min);
+        assert!(
+            tightest > mean / 2.0,
+            "{key}: samples {tightest} s apart against a mean of {mean} s"
+        );
+    }
+}
