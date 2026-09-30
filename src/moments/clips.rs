@@ -16,7 +16,9 @@ pub struct Moment {
 }
 
 impl Moment {
-    /// The instant to centre a clip on, in seconds from the start of the video.
+    /// Where a clip for this moment starts from, in seconds from the start of
+    /// the video: the instant itself, or for a window metric the start of the
+    /// window, which the clip then runs the length of.
     pub fn video_time_s(&self) -> Option<f64> {
         self.entry.video_time_s
     }

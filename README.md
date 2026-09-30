@@ -376,9 +376,13 @@ estimate* of which way is down, not a measurement, and it is wrong.
 
 Where the machine is rolling straight, upright, and neither braking nor
 driving, the only force acting on it is gravity — so the accelerometer, which
-measures force, **is** the vertical. On the reference ride `GRAV` sits a median
-8° off it, steadily, from one end of the recording to the other (5.7° taken as
-a single rotation; 8.4° on the next recording).
+measures force, **is** the vertical. On the reference ride `GRAV` sits 4.8° off
+it, steadily, from one end of the recording to the other. That is the single
+rotation fitted over its 987 coasting samples — the component-wise median of
+the per-sample rotations, and the correction actually applied. The median of
+the per-sample *angles* is larger, 6.4°, and is not the tilt: an angle is a
+magnitude, so accelerometer vibration adds to it whichever way it points. (An
+earlier version of this section quoted that kind of figure, as 8°.)
 
 What that costs depends on how a channel uses `GRAV`. Lean and pitch are angles
 against a reference fitted from `GRAV` itself, so a fixed tilt cancels: both
@@ -390,10 +394,13 @@ not there.
 
 So `GRAV` is put back on the accelerometer's vertical before anything reads it:
 the rotation taking one onto the other, measured as a component-wise median
-over the coasting samples, applied to the whole stream. Straight-line lateral
-load falls from 0.092 g to 0.012 g, and total acceleration — a magnitude, which
-owes nothing to any frame — comes through bit-identical, which is the check
-that the correction is a rotation and nothing more.
+over the coasting samples, applied to the whole stream. On straights judged by
+GPS course alone, which the correction never reads, lateral load falls from
+0.047 g to 0.007 g. That the correction is a rotation and nothing more is
+checked on the road-frame split: longitudinal, lateral and vertical still add
+back up to the total on every sample, which they do only while `GRAV` stays a
+unit vector and the axes stay square. (Total acceleration alone cannot show it:
+it is the accelerometer's own magnitude and never reads `GRAV`.)
 
 Unlike the roll zero this is *not* tracked over time, and not because it was
 easier. The roll zero describes where the camera sits on the machine, which a
