@@ -223,9 +223,7 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     let mut file = gmax::mp4::Mp4::open(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let container_duration = file.duration_secs();
-    let telemetry = gmax::gpmf::from_mp4(&mut file)
-        .map_err(anyhow::Error::from)
-        .and_then(|gpmf| {
+    let telemetry = gmax::gpmf::from_mp4(&mut file).and_then(|gpmf| {
             telemetry::compute(
                 &gpmf,
                 &telemetry::Options {
@@ -886,6 +884,9 @@ fn cmd_analyse(args: &gmax::cli::AnalyseArgs, quiet: bool) -> Result<()> {
         "gpx" => {
             let g = gmax::gpx::read_file(&args.input)
                 .with_context(|| format!("reading {}", args.input.display()))?;
+            for w in &g.warnings {
+                eprintln!("gmax: warning: {w}");
+            }
             let name = g.name.clone().unwrap_or_else(|| args.input.display().to_string());
             (moments::samples_from_gpx(&g), name, Vec::new())
         }

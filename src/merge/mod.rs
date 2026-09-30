@@ -277,7 +277,7 @@ pub fn slots_from_telemetry(t: &Telemetry) -> Vec<Slot> {
         };
         slots.push(Slot {
             time,
-            video_time_s: Some(fix.time),
+            video_time_s: t.video_time_of(fix.time),
             fix: fix.valid.then(|| TrackPoint {
                 lat: fix.lat,
                 lon: fix.lon,
@@ -378,10 +378,15 @@ pub fn slots_from_gpx(base: &Gpx) -> Vec<Slot> {
 /// were repaired; see [`apply_to_fixes`] for what else changes.
 pub fn apply_to_telemetry(t: &mut Telemetry, merged: &Gpx) -> usize {
     let clocked = t.t0.is_some();
-    apply_to_fixes(&mut t.gps, clocked, merged)
+    let origin = t.times.first().copied().unwrap_or(0.0);
+    apply_to_fixes(&mut t.gps, origin, clocked, merged)
 }
 
 /// The body of [`apply_to_telemetry`], on the fixes alone.
+///
+/// `origin` is the timeline's first timestamp, which a slot's video time is
+/// measured from (see [`Telemetry::video_time_of`]); on a clip cut from a
+/// longer recording it is where the cut began, not zero.
 ///
 /// `clocked` says whether the telemetry had a clock to date fixes that carry
 /// no UTC of their own; a fix with neither never became a slot, so the merge
@@ -395,9 +400,9 @@ pub fn apply_to_telemetry(t: &mut Telemetry, merged: &Gpx) -> usize {
 /// tens of metres behind its corrected neighbours. Such a fix is left without
 /// a reject reason, since none of the receiver-quality reasons applies — its
 /// position was sound, only too stale to use at its own instant.
-pub fn apply_to_fixes(fixes: &mut [GpsFix], clocked: bool, merged: &Gpx) -> usize {
+pub fn apply_to_fixes(fixes: &mut [GpsFix], origin: f64, clocked: bool, merged: &Gpx) -> usize {
     // Video times of the camera's own fixes, ascending, for bisection.
-    let fix_times: Vec<f64> = fixes.iter().map(|f| f.time).collect();
+    let fix_times: Vec<f64> = fixes.iter().map(|f| f.time - origin).collect();
     let mut placed = vec![false; fixes.len()];
     let mut repaired = 0;
     for p in &merged.points {

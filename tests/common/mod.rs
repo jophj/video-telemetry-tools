@@ -25,6 +25,9 @@ pub const REFERENCE_360: &str = "sources/GS010527.360";
 /// ```
 pub const REFERENCE_CSV: &str = "sources/GS010527.prototype-telemetry.csv";
 
+/// The phone's GPX of the same ride as [`REFERENCE_360`], from the same tank bag.
+pub const REFERENCE_PHONE_GPX: &str = "sources/phone.gpx";
+
 /// A MotionRecord ride export: the upstream form of an external GPS source.
 pub const REFERENCE_RIDE_JSON: &str = "sources/66e6c51d_kurvenfokus.json";
 

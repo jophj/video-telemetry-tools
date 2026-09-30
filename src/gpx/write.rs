@@ -251,7 +251,7 @@ pub fn from_telemetry(t: &Telemetry, name: Option<String>) -> Gpx {
             accel_ms2: t.accel_lon_g.as_ref().map(|v| v[i] * crate::math::G),
             at_sensor_limit: false,
             source: Some(fix.source.as_str().to_string()),
-            video_time_s: Some(fix.time),
+            video_time_s: t.video_time_of(fix.time),
             segment: 0,
         });
     }

@@ -486,7 +486,7 @@ fn fixes_a_lag_correction_leaves_behind_are_invalidated_not_left_stale() {
     );
     assert!(report.points_unpositioned > 0);
 
-    merge::apply_to_fixes(&mut fixes, true, &merged);
+    merge::apply_to_fixes(&mut fixes, 0.0, true, &merged);
     let by_time = |vt: f64| merged.points.iter().find(|p| (p.video_time_s.unwrap() - vt).abs() < 1e-6);
     for f in &fixes {
         match by_time(f.time) {
@@ -598,11 +598,8 @@ fn repairs_the_reference_clip_from_the_phone_track() {
 fn measures_the_cameras_gps_latency_on_real_material() {
     let base_path = fixture_or_skip!(common::REFERENCE_360);
     // Needs the matching phone track, which the caller must have generated.
-    let ext_path = std::path::Path::new("/tmp/phone.gpx");
-    if !ext_path.exists() {
-        eprintln!("SKIP: /tmp/phone.gpx not present (generate with motion-analyse --gpx)");
-        return;
-    }
+    // The phone track recorded alongside it (generate with motion-analyse --gpx).
+    let ext_path = &fixture_or_skip!(common::REFERENCE_PHONE_GPX);
 
     let mut f = gmax::mp4::Mp4::open(&base_path).unwrap();
     let g = gmax::gpmf::from_mp4(&mut f).unwrap();
