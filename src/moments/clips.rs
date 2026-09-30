@@ -81,19 +81,30 @@ impl Clip {
     }
 
     /// The moment that names the clip: lowest metric priority, then best rank.
-    pub fn head(&self) -> &Moment {
-        &self.moments[0]
+    ///
+    /// None for a clip that was asked for by time rather than found by ranking.
+    pub fn head(&self) -> Option<&Moment> {
+        self.moments.first()
     }
 
     pub fn name(&self, stem: &str) -> String {
-        let h = self.head();
-        format!(
-            "{stem}_{}{:02}_{}_t{:04}",
-            h.slug(),
-            h.entry.rank,
-            h.value_token(),
-            self.start_s as i64
-        )
+        match self.head() {
+            Some(h) => format!(
+                "{stem}_{}{:02}_{}_t{:04}",
+                h.slug(),
+                h.entry.rank,
+                h.value_token(),
+                self.start_s as i64
+            ),
+            // A hand-cut clip has no moment to name it, so the window does:
+            // where it starts and how long it runs. The decimal point becomes
+            // a `p` because a second dot in a filename reads as an extension.
+            None => format!(
+                "{stem}_cut_t{:04}_{}s",
+                self.start_s as i64,
+                fmt_num(self.duration_s(), 2).replace('.', "p")
+            ),
+        }
     }
 }
 
@@ -131,6 +142,54 @@ impl Default for PlanOptions {
 pub struct Dropped {
     pub moment: Moment,
     pub reason: String,
+}
+
+/// One clip asked for by time: `--ss` for `--duration`, with no ranking.
+///
+/// It is clamped and floored by the same `PlanOptions` a ranked clip is, so a
+/// duration running past the end of the video is shortened to it rather than
+/// handed to ffmpeg to fail on, and the same minimum length applies.
+///
+/// Omitting the duration means the rest of the video, which needs the video's
+/// length to be known.
+pub fn manual(start_s: f64, duration_s: Option<f64>, opts: &PlanOptions) -> anyhow::Result<Clip> {
+    if !start_s.is_finite() || start_s < 0.0 {
+        anyhow::bail!("a clip cannot start at {start_s} s");
+    }
+    if let Some(d) = duration_s {
+        if !d.is_finite() || d <= 0.0 {
+            anyhow::bail!("a clip cannot be {d} s long");
+        }
+    }
+    if let Some(v) = opts.duration_s {
+        if start_s >= v {
+            anyhow::bail!("a clip starting at {start_s:.3} s is past the video's {v:.3} s");
+        }
+    }
+
+    let mut end_s = match duration_s {
+        Some(d) => start_s + d,
+        None => opts.duration_s.ok_or_else(|| {
+            anyhow::anyhow!("no duration given, and the video's own length is not known")
+        })?,
+    };
+    if let Some(v) = opts.duration_s {
+        end_s = end_s.min(v);
+    }
+
+    let clip = Clip {
+        start_s,
+        end_s,
+        moments: Vec::new(),
+    };
+    if clip.duration_s() < opts.min_duration_s {
+        anyhow::bail!(
+            "clip would be only {:.2} s long, below the {:.2} s minimum",
+            clip.duration_s(),
+            opts.min_duration_s
+        );
+    }
+    Ok(clip)
 }
 
 /// Group the analysis's moments into clip windows.

@@ -540,3 +540,52 @@ fn lean_that_the_lateral_load_supports_passes_quietly() {
     }
     assert_eq!(lean_warning(&blind), None);
 }
+
+#[test]
+fn a_clip_asked_for_by_time_is_clamped_to_the_video() {
+    use gmax::moments::clips::{self, PlanOptions};
+
+    let opts = PlanOptions {
+        duration_s: Some(1537.5),
+        ..Default::default()
+    };
+
+    let c = clips::manual(300.0, Some(8.5), &opts).expect("a clip well inside the video");
+    assert_eq!(c.start_s, 300.0);
+    assert_eq!(c.end_s, 308.5);
+    assert!(c.moments.is_empty(), "nothing was ranked, so nothing chose it");
+
+    // A duration running off the end is shortened to the end rather than
+    // handed to ffmpeg to fail on.
+    let c = clips::manual(1500.0, Some(600.0), &opts).expect("a clip overrunning the end");
+    assert_eq!(c.end_s, 1537.5);
+
+    // No duration means the rest of the video.
+    let c = clips::manual(1000.0, None, &opts).expect("a clip to the end");
+    assert_eq!(c.end_s, 1537.5);
+
+    // And a start past the end is refused, naming both times.
+    let err = clips::manual(2000.0, Some(5.0), &opts).unwrap_err().to_string();
+    assert!(err.contains("2000") && err.contains("1537"), "error was: {err}");
+
+    // As is a window too short to be a clip, or a negative one.
+    assert!(clips::manual(10.0, Some(0.2), &opts).is_err());
+    assert!(clips::manual(10.0, Some(-5.0), &opts).is_err());
+    assert!(clips::manual(-1.0, Some(5.0), &opts).is_err());
+}
+
+#[test]
+fn a_hand_cut_clip_is_named_by_its_window() {
+    use gmax::moments::clips::{self, PlanOptions};
+
+    let opts = PlanOptions {
+        duration_s: Some(600.0),
+        ..Default::default()
+    };
+    // No moment to name it after, so the window does. The fractional second
+    // becomes a `p`, because a second dot in a filename reads as an extension.
+    let c = clips::manual(300.0, Some(8.5), &opts).unwrap();
+    assert_eq!(c.name("GS010527"), "GS010527_cut_t0300_8p5s");
+    let c = clips::manual(12.0, Some(30.0), &opts).unwrap();
+    assert_eq!(c.name("GS010527"), "GS010527_cut_t0012_30s");
+}

@@ -207,62 +207,96 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     let mut file = gmax::mp4::Mp4::open(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let container_duration = file.duration_secs();
-    let gpmf = gmax::gpmf::from_mp4(&mut file)?;
-    let mut t = telemetry::compute(
-        &gpmf,
-        &telemetry::Options {
-            max_dop: args.max_dop,
-            ..Default::default()
-        },
-    )?;
-    for w in &t.warnings {
-        eprintln!("gmax: warning: {w}");
-    }
-    if let Some(gpx) = &args.gps {
-        repair_positions(&mut t, gpx, quiet)?;
+    let telemetry = gmax::gpmf::from_mp4(&mut file)
+        .map_err(anyhow::Error::from)
+        .and_then(|gpmf| {
+            telemetry::compute(
+                &gpmf,
+                &telemetry::Options {
+                    max_dop: args.max_dop,
+                    ..Default::default()
+                },
+            )
+        });
+    // Ranking needs the telemetry. A cut asked for by time does not: it is the
+    // way to get a clip out of a ride whose telemetry is too broken to read,
+    // so there it only costs the sibling CSV.
+    let mut t = match telemetry {
+        Ok(t) => Some(t),
+        Err(e) if args.ss.is_some() => {
+            eprintln!("gmax: warning: no telemetry, so none is written beside the clip: {e:#}");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(t) = &mut t {
+        for w in &t.warnings {
+            eprintln!("gmax: warning: {w}");
+        }
+        if let Some(gpx) = &args.gps {
+            repair_positions(t, gpx, quiet)?;
+        }
     }
 
-    let samples = moments::samples_from_telemetry(&t);
-    let mut analysis = moments::analyse(
-        &samples,
-        &Options {
-            top: args.top,
-            min_gap_s: args.min_gap,
-            curve_threshold_deg: args.curve_threshold,
-            window_s: args.window,
-            metrics,
-            ..Default::default()
-        },
-    )?;
-    analysis.source = args.input.display().to_string();
+    let plan_opts = clips::PlanOptions {
+        pre_s: args.pre,
+        post_s: args.post,
+        merge_gap_s: args.merge_gap,
+        duration_s: Some(container_duration),
+        ..Default::default()
+    };
 
-    let (planned, dropped) = clips::plan(
-        &analysis,
-        &clips::PlanOptions {
-            pre_s: args.pre,
-            post_s: args.post,
-            merge_gap_s: args.merge_gap,
-            duration_s: Some(container_duration),
-            ..Default::default()
-        },
-    );
-    if planned.is_empty() {
-        anyhow::bail!(
-            "no clips could be planned from {} moment(s); the ride may be too short or have no \
-             usable telemetry",
-            dropped.len()
-        );
-    }
+    // A cut asked for by time skips the ranking entirely. Not just to save the
+    // work: it is the one way to get a clip out of a ride whose telemetry is
+    // too sparse or too broken to analyse, and that is exactly when someone
+    // reaches for it.
+    let (planned, dropped) = match args.ss {
+        Some(start) => (
+            vec![clips::manual(start, args.duration, &plan_opts)?],
+            Vec::new(),
+        ),
+        None => {
+            let t = t.as_ref().expect("ranking bails without telemetry");
+            let samples = moments::samples_from_telemetry(t);
+            let mut analysis = moments::analyse(
+                &samples,
+                &Options {
+                    top: args.top,
+                    min_gap_s: args.min_gap,
+                    curve_threshold_deg: args.curve_threshold,
+                    window_s: args.window,
+                    metrics,
+                    ..Default::default()
+                },
+            )?;
+            analysis.source = args.input.display().to_string();
+            let (planned, dropped) = clips::plan(&analysis, &plan_opts);
+            if planned.is_empty() {
+                anyhow::bail!(
+                    "no clips could be planned from {} moment(s); the ride may be too short or \
+                     have no usable telemetry",
+                    dropped.len()
+                );
+            }
+            (planned, dropped)
+        }
+    };
 
     let stem = args
         .input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "ride".into());
+    // "highlights" is a claim the ranking earns and a hand-cut clip does not.
+    let dir_name = if args.ss.is_some() {
+        format!("{stem}_clips")
+    } else {
+        format!("{stem}_highlights")
+    };
     let outdir = args
         .outdir
         .clone()
-        .unwrap_or_else(|| args.input.with_file_name(format!("{stem}_highlights")));
+        .unwrap_or_else(|| args.input.with_file_name(&dir_name));
     // A .360 clip keeps both lenses, so its extension stays .360.
     let ext = args
         .input
@@ -271,25 +305,32 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
         .unwrap_or_else(|| "mp4".into());
 
     if !quiet || args.dry_run {
-        println!(
-            "{} clip(s) planned from {} moment(s), into {}",
-            planned.len(),
-            planned.iter().map(|c| c.moments.len()).sum::<usize>(),
-            outdir.display()
-        );
-        for c in &planned {
+        if args.ss.is_some() {
+            println!("1 clip requested, into {}", outdir.display());
+        } else {
             println!(
-                "  {:>8.2}..{:<8.2} ({:>5.2}s)  {}",
+                "{} clip(s) planned from {} moment(s), into {}",
+                planned.len(),
+                planned.iter().map(|c| c.moments.len()).sum::<usize>(),
+                outdir.display()
+            );
+        }
+        for c in &planned {
+            // A hand-cut clip has no moments to describe it, so it is named by
+            // the file it will become.
+            let what = if c.moments.is_empty() {
+                c.name(&stem)
+            } else {
+                c.moments.iter().map(|m| m.label()).collect::<Vec<_>>().join(", ")
+            };
+            println!(
+                "  {:>8.2}..{:<8.2} ({:>5.2}s)  {what}",
                 c.start_s,
                 c.end_s,
                 c.duration_s(),
-                c.moments
-                    .iter()
-                    .map(|m| m.label())
-                    .collect::<Vec<_>>()
-                    .join(", ")
             );
         }
+
         for d in &dropped {
             println!("  skipped {}: {}", d.moment.label(), d.reason);
         }
@@ -339,8 +380,9 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     // mount from that one corner and reports a lean several degrees off the
     // ride it was cut from -- which is exactly the disagreement that is
     // confusing to run into and impossible to adjudicate from inside the clip.
-    for (c, path) in &written {
-        if let Err(e) = write_clip_telemetry(&t, path, c) {
+    for (c, path) in written.iter().filter(|_| t.is_some()) {
+        let Some(t) = &t else { break };
+        if let Err(e) = write_clip_telemetry(t, path, c) {
             eprintln!("gmax: warning: no telemetry written for {}: {e:#}", path.display());
         } else if !quiet {
             println!("wrote {}", clip_telemetry_path(path).display());
@@ -348,32 +390,70 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     }
 
     // A manifest, so the clips can be traced back to the moments that chose them.
-    let manifest = serde_json::json!({
+    let mut clips_json: Vec<serde_json::Value> = written
+        .iter()
+        .map(|(c, path)| {
+            let mut clip = serde_json::json!({
+                "file": path.file_name().map(|f| f.to_string_lossy().to_string()),
+                "startSeconds": c.start_s,
+                "endSeconds": c.end_s,
+                "durationSeconds": c.duration_s(),
+                "moments": c.moments.iter().map(|m| serde_json::json!({
+                    "metric": m.metric.slug(),
+                    "rank": m.entry.rank,
+                    "label": m.label(),
+                    "value": m.entry.value,
+                    "unit": m.metric.unit(),
+                    "videoTimeSeconds": m.entry.video_time_s,
+                    "lat": m.entry.pos.map(|(lat, _)| lat),
+                    "lon": m.entry.pos.map(|(_, lon)| lon),
+                })).collect::<Vec<_>>(),
+            });
+            // A hand cut records what was asked for beside what was cut, since
+            // the window is clamped to the video.
+            if let Some(start) = args.ss {
+                clip["requested"] = serde_json::json!({
+                    "startSeconds": start,
+                    "durationSeconds": args.duration,
+                });
+            }
+            clip
+        })
+        .collect();
+    let manifest_path = outdir.join(format!("{dir_name}.json"));
+    // Hand cuts arrive one per run into the same directory, so each run adds
+    // to the manifest rather than replacing it; a re-cut of the same file
+    // replaces its own entry. A ranking run is one complete plan and rewrites.
+    if args.ss.is_some() {
+        let previous = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|m| m.get("clips").and_then(|c| c.as_array()).cloned())
+            .unwrap_or_default();
+        let fresh: Vec<_> = clips_json.iter().map(|c| c["file"].clone()).collect();
+        let mut kept: Vec<_> = previous
+            .into_iter()
+            .filter(|c| !fresh.contains(&c["file"]))
+            .collect();
+        kept.append(&mut clips_json);
+        clips_json = kept;
+    }
+    let mut manifest = serde_json::json!({
         "source": args.input.display().to_string(),
         "sourceDurationSeconds": container_duration,
-        "window": { "preSeconds": args.pre, "postSeconds": args.post, "mergeGapSeconds": args.merge_gap },
-        "clips": written.iter().map(|(c, path)| serde_json::json!({
-            "file": path.file_name().map(|f| f.to_string_lossy().to_string()),
-            "startSeconds": c.start_s,
-            "endSeconds": c.end_s,
-            "durationSeconds": c.duration_s(),
-            "moments": c.moments.iter().map(|m| serde_json::json!({
-                "metric": m.metric.slug(),
-                "rank": m.entry.rank,
-                "label": m.label(),
-                "value": m.entry.value,
-                "unit": m.metric.unit(),
-                "videoTimeSeconds": m.entry.video_time_s,
-                "lat": m.entry.pos.map(|(lat, _)| lat),
-                "lon": m.entry.pos.map(|(_, lon)| lon),
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
+        "clips": clips_json,
         "dropped": dropped.iter().map(|d| serde_json::json!({
             "label": d.moment.label(),
             "reason": d.reason,
         })).collect::<Vec<_>>(),
     });
-    let manifest_path = outdir.join(format!("{stem}_highlights.json"));
+    if args.ss.is_none() {
+        manifest["window"] = serde_json::json!({
+            "preSeconds": args.pre,
+            "postSeconds": args.post,
+            "mergeGapSeconds": args.merge_gap,
+        });
+    }
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     if !quiet {
         println!("wrote {}", manifest_path.display());

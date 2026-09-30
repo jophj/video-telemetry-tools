@@ -12,7 +12,7 @@ gmax telemetry <in.360> [-o out.csv] [--json]
 gmax gpx       <in.360> [-o out.gpx]
 gmax merge     <base.360|base.gpx> --with external.gpx [-o merged.gpx]
 gmax analyse   <video|csv|gpx> [--json] [--chapters F] [--edl F] [--cues F]
-gmax clips     <in.360> [--top N] [--metric LIST]
+gmax clips     <in.360> [--top N] [--metric LIST] | [--ss S [--duration S]]
 gmax viewer    <video> [--telemetry F] [--port 8360]
 gmax encoders  [--accel gpu|cpu]
 ```
@@ -39,6 +39,9 @@ gmax analyse GS010527.360
 
 # Cut them out, losslessly.
 gmax clips GS010527.360 --top 5
+
+# Or cut one window by hand: 30 s from twenty minutes in.
+gmax clips GS010527.360 --ss 1200 --duration 30
 
 # Watch it back with the telemetry overlaid.
 gmax viewer GS010527_equirect.mp4
@@ -172,6 +175,28 @@ manifest records which moment chose each clip.
 A stream copy can only begin at a keyframe, so a clip starts at or before the
 requested instant and may run a little longer. Trimming to the frame would mean
 re-encoding.
+
+#### Cutting a window by hand
+
+`--ss S` cuts one clip starting there instead of ranking anything, running for
+`--duration S` or to the end of the video. The names match `gmax convert`,
+which takes the same pair. The clip lands in `<stem>_clips/` as
+`<stem>_cut_t<start>_<duration>s.360`, with the same sibling telemetry a
+ranked clip gets. Each hand cut is added to `<stem>_clips.json` rather than
+replacing it, so a run of cuts from one ride ends with one manifest listing
+them all, each with the window that was asked for beside the one that was cut.
+
+The ranking options — `--top`, `--metric`, `--pre`, `--post`, `--merge-gap`,
+`--min-gap`, `--curve-threshold`, `--window` — cannot shape a window that was
+given outright, so they are refused alongside `--ss` rather than silently
+ignored. `--gps` and `--max-dop` still apply: they shape the telemetry written
+beside the clip.
+
+Nothing is ranked, and nothing is even analysed, which is the other reason to
+reach for it: a hand cut works on a ride whose telemetry is too sparse or too
+broken to rank. If the telemetry cannot be read at all, the clip is still cut
+and only its sibling CSV is skipped, with a warning saying why. A start past the end of the video is refused; a duration
+running past it is shortened to it.
 
 #### A clip cannot calibrate itself
 

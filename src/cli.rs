@@ -43,7 +43,7 @@ pub enum Command {
     /// Stitch a .360 to an equirectangular video.
     Convert(ConvertArgs),
 
-    /// Cut clips around the ride's interesting moments.
+    /// Cut clips around the ride's interesting moments, or one by time.
     Clips(ClipsArgs),
 
     /// Serve the browser telemetry viewer.
@@ -95,9 +95,29 @@ pub struct ClipsArgs {
     #[arg(long, value_name = "GPX")]
     pub gps: Option<PathBuf>,
 
-    /// Output directory. Defaults to <input stem>_highlights.
+    /// Output directory. Defaults to <input stem>_highlights, or
+    /// <input stem>_clips for a cut asked for by time.
     #[arg(short, long)]
     pub outdir: Option<PathBuf>,
+
+    /// Cut one clip starting this many seconds in, instead of ranking moments.
+    ///
+    /// Named for ffmpeg's own seek flag, and the same as `gmax convert --ss`.
+    /// The ranking options do not apply to such a cut and are refused with it;
+    /// --gps and --max-dop still shape the telemetry written beside the clip.
+    #[arg(
+        long,
+        value_name = "S",
+        conflicts_with_all = [
+            "top", "metric", "pre", "post", "merge_gap", "min_gap",
+            "curve_threshold", "window",
+        ]
+    )]
+    pub ss: Option<f64>,
+
+    /// How long that clip runs. Defaults to the rest of the video.
+    #[arg(long, value_name = "S", requires = "ss")]
+    pub duration: Option<f64>,
 
     /// Moments to cut per metric.
     #[arg(long, default_value_t = 5, value_name = "N")]

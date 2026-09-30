@@ -163,3 +163,84 @@ fn an_empty_gpx_is_refused_rather_than_merged() {
     assert!(err.contains("no track points"), "stderr was: {err}");
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn a_clip_by_time_needs_a_start_and_refuses_the_ranking_options() {
+    // --duration says how long the --ss clip runs, so it means nothing alone.
+    let out = run(&["clips", "x.360", "--duration", "10"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--ss"), "stderr was: {err}");
+
+    // The ranking options cannot shape a window that was given, so asking for
+    // both is a misunderstanding worth reporting rather than half-honouring.
+    for (flag, value) in [("--top", "3"), ("--pre", "2"), ("--metric", "lean")] {
+        let out = run(&["clips", "x.360", "--ss", "10", flag, value]);
+        assert!(!out.status.success(), "{flag} was accepted alongside --ss");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be used with"), "stderr was: {err}");
+    }
+
+    // But the telemetry options still apply: they shape the CSV written
+    // beside the clip, which a hand-cut clip gets exactly like a ranked one.
+    let out = run(&["clips", "x.360", "--ss", "10", "--max-dop", "3", "--dry-run"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("cannot be used with"), "stderr was: {err}");
+}
+
+#[test]
+fn hand_cuts_need_no_telemetry_and_share_one_manifest() {
+    if common::which("ffmpeg").is_none() {
+        eprintln!("SKIP: ffmpeg is not installed");
+        return;
+    }
+    // Two lens strips shaped like a .360's (3 x 32 px faces + 2 x 4 px of
+    // overlap), and no GPMF track at all: the ride a hand cut exists for.
+    let dir = std::env::temp_dir().join(format!("gmax-handcut-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("ride.360");
+    let made = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=104x32:rate=10:duration=6"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=104x32:rate=10:duration=6"])
+        .args(["-map", "0", "-map", "1", "-c:v", "mpeg4", "-g", "10", "-f", "mov"])
+        .arg(&input)
+        .status()
+        .expect("run ffmpeg");
+    assert!(made.success(), "could not build the synthetic input");
+    let input = input.to_str().unwrap();
+
+    for start in ["1", "3"] {
+        let out = run(&["clips", input, "--ss", start, "--duration", "1.5"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "--ss {start} failed: {err}");
+        assert!(err.contains("no telemetry"), "the missing CSV went unexplained: {err}");
+    }
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("ride_clips").join("ride_clips.json")).unwrap(),
+    )
+    .unwrap();
+    let files: Vec<_> = manifest["clips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["file"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(files, ["ride_cut_t0001_1p5s.360", "ride_cut_t0003_1p5s.360"]);
+    for f in &files {
+        assert!(dir.join("ride_clips").join(f).exists(), "{f} was not cut");
+    }
+    assert_eq!(manifest["clips"][1]["requested"]["startSeconds"], 3.0);
+
+    // Cutting the same window again replaces its entry rather than doubling it.
+    let out = run(&["clips", input, "--ss", "3", "--duration", "1.5", "--overwrite"]);
+    assert!(out.status.success());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("ride_clips").join("ride_clips.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["clips"].as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
