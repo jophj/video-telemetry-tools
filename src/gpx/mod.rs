@@ -10,7 +10,9 @@
 //!   * the same namespace gets different prefixes from different tools
 //!     (`gpxtpx:`, `gpxx:`, `ns3:`), and
 //!   * Garmin's TrackPointExtension exists in v1 and v2 with different URIs —
-//!     the GoPro prototype wrote v1, `motion-record-analysis` writes v2.
+//!     the GoPro prototype wrote v1, `motion-record-analysis` writes v2. We
+//!     read both and write v2, the only version that defines `speed` and
+//!     `course`.
 //!
 //! Lean angle has no standard home in GPX at all, so it lives in a custom
 //! namespace. We read anyone's `lean` element and write our own.
@@ -27,11 +29,20 @@ pub use write::{write_file, WriteOptions};
 pub mod ns {
     pub const GPX: &str = "http://www.topografix.com/GPX/1/1";
     pub const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
-    pub const SCHEMA_LOCATION: &str =
-        "http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd";
-    /// Garmin TrackPointExtension v1, which is what carries `speed`/`course`
-    /// in the widest range of consumers.
-    pub const GPXTPX: &str = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1";
+    /// Namespace/schema pairs for `xsi:schemaLocation`: GPX itself, and the
+    /// Garmin extension our `speed`/`course` live in.
+    pub const SCHEMA_LOCATION: &str = "http://www.topografix.com/GPX/1/1 \
+         http://www.topografix.com/GPX/1/1/gpx.xsd \
+         http://www.garmin.com/xmlschemas/TrackPointExtension/v2 \
+         https://www8.garmin.com/xmlschemas/TrackPointExtensionv2.xsd";
+    /// Garmin TrackPointExtension v2. Not v1: v1 defines temperature, depth,
+    /// heart rate and cadence only, so `speed` and `course` written under it
+    /// are elements its schema does not have, and a validating consumer
+    /// rejects them.
+    pub const GPXTPX: &str = "http://www.garmin.com/xmlschemas/TrackPointExtension/v2";
+    /// The v1 URI, which the reader still accepts because older tools —
+    /// including the GoPro prototype — wrote it.
+    pub const GPXTPX_V1: &str = "http://www.garmin.com/xmlschemas/TrackPointExtension/v1";
     /// `gmax`'s own channels: lean angle and the rest of the rider telemetry.
     pub const GT: &str = "https://github.com/gopro-tools/telemetry/1";
 }
@@ -58,6 +69,11 @@ pub struct TrackPoint {
     pub source: Option<String>,
     /// Seconds from the start of the video this point corresponds to.
     pub video_time_s: Option<f64>,
+    /// Which `<trkseg>` this point was read from, counted across every
+    /// `<trk>` in the file. A segment boundary is the producer saying the
+    /// receiver stopped logging, so interpolation never crosses one and the
+    /// writer starts a new segment wherever it changes.
+    pub segment: usize,
 }
 
 /// A whole track.
@@ -70,12 +86,17 @@ pub struct Gpx {
     pub time: Option<DateTime<Utc>>,
     pub points: Vec<TrackPoint>,
     /// Free-form key/value pairs read from or written to
-    /// `<metadata><extensions>`.
+    /// `<metadata><extensions>`. Reading them back is what lets a merged
+    /// track's audit trail survive a round trip.
     pub metadata: Vec<(String, String)>,
+    /// Non-fatal problems found while reading, such as timestamps that could
+    /// not be parsed. Never written.
+    pub warnings: Vec<String>,
 }
 
 impl Gpx {
-    /// Points carrying a timestamp, which is all a merge can use.
+    /// Points carrying a timestamp, which is all a merge can use. In time
+    /// order: the reader guarantees it.
     pub fn timed_points(&self) -> Vec<&TrackPoint> {
         self.points.iter().filter(|p| p.time.is_some()).collect()
     }

@@ -94,8 +94,10 @@ Every lateral channel is signed **positive to the right**.
 ### `gpx` — a GPX 1.1 track
 
 One point per GPS fix, with speed and course in the Garmin
-`TrackPointExtension` and lean angle in a `gt:` namespace, since GPX has no
-standard home for it. Validates against the official GPX 1.1 schema.
+`TrackPointExtension` v2 (v1 has no such elements) and lean angle in a `gt:`
+namespace, since GPX has no standard home for it. Validates against the
+official GPX 1.1 schema. Reading accepts either extension version, keeps
+segment boundaries, and reads times with no zone as UTC, with a warning.
 
 ### `merge` — repair the GPS from another source
 
@@ -118,17 +120,29 @@ positions alone cannot separate them:
   peak is sharp.
 - **The camera's GPS latency** — how far behind its positions run relative to
   the timestamps attached to them. This is the difference between the
-  positional fit and the lean fit, and the positions are re-timed by it.
+  positional fit and the lean fit, and the positions are re-timed by it. The
+  positional fit searches around the lean offset, so a large clock offset
+  does not clip the latency.
+
+An alignment that is weak (best lean `|r|` below 0.5) or whose optimum sits on
+the edge of the `--align-span` search is reported as unreliable, and no
+latency is corrected against it; widen the span or pass `--time-offset`.
 
 Then each point is decided on measured quality. Both sources are scored on
 their own self-consistency — the spread of position-differenced speed against
 reported Doppler speed, which needs no external truth — and the better
 receiver takes the overlap. `--prefer gopro` or `--prefer external` overrides.
 
-Positions are never invented. Substitution needs external points bracketing
-the instant, so nothing is extrapolated past the ends of the external track,
-and a point neither source can place is left out rather than filled in. Every
-run records its method, offset, latency, residual disagreement and both
+Positions are never invented. A source's position at an instant is
+interpolated between its samples either side when they are no further apart
+than `--max-dt` or two and a half of its own sample intervals, whichever is
+larger, and never across a segment break; otherwise its nearest sample is
+used if it is within `--max-dt`. Nothing is extrapolated past the ends of the
+external track, and a point neither source can place is left out rather than
+filled in. Where the camera rejected a fix and only its own neighbours can
+place it, the point is labelled `interpolated`. The external lean angle only
+fills gaps in the camera's, and is negated first if the two disagree in sign.
+Every run records its method, offset, latency, residual disagreement and both
 quality scores in the GPX metadata, so a repaired track can be audited.
 
 ### `analyse` — rank the interesting moments

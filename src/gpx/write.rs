@@ -94,7 +94,15 @@ pub fn write_to<W: Write>(gpx: &Gpx, w: &mut W, opts: &WriteOptions) -> anyhow::
     let activity = gpx.activity.as_deref().unwrap_or(&opts.activity);
     writeln!(w, "    <type>{}</type>", escape(activity))?;
     writeln!(w, "    <trkseg>")?;
+    // A change of segment is a break the source recorded, so it is kept as
+    // one rather than joined into a single run of points.
+    let mut segment = gpx.points.first().map(|p| p.segment);
     for p in &gpx.points {
+        if segment != Some(p.segment) {
+            writeln!(w, "    </trkseg>")?;
+            writeln!(w, "    <trkseg>")?;
+            segment = Some(p.segment);
+        }
         write_point(w, p, opts.extensions)?;
     }
     writeln!(w, "    </trkseg>")?;
@@ -126,17 +134,25 @@ fn write_point<W: Write>(w: &mut W, p: &TrackPoint, extensions: bool) -> anyhow:
     // but pointless, and omitting it keeps a no-telemetry track compact.
     let mut ext = String::new();
     if extensions {
+        // TrackPointExtension v2 fixes the order of its children (atemp,
+        // wtemp, depth, hr, cad, speed, course, bearing), so speed goes before
+        // course. Its types also bound the values: speed is non-negative and
+        // course lies in [0, 360), so a heading that rounds up to 360 is
+        // written as the 0 it means.
         let mut tpx = String::new();
-        if let Some(s) = p.speed_ms {
+        if let Some(s) = p.speed_ms.filter(|s| s.is_finite()) {
             tpx.push_str(&format!(
                 "            <gpxtpx:speed>{}</gpxtpx:speed>\n",
-                fmt_num(s, 3)
+                fmt_num(s.max(0.0), 3)
             ));
         }
-        if let Some(c) = p.course_deg {
+        if let Some(c) = p.course_deg.filter(|c| c.is_finite()) {
+            let mut text = fmt_num(c.rem_euclid(360.0), 1);
+            if text == "360" {
+                text = "0".to_string();
+            }
             tpx.push_str(&format!(
-                "            <gpxtpx:course>{}</gpxtpx:course>\n",
-                fmt_num(c, 1)
+                "            <gpxtpx:course>{text}</gpxtpx:course>\n"
             ));
         }
         if !tpx.is_empty() {
@@ -222,11 +238,12 @@ pub fn from_telemetry(t: &Telemetry, name: Option<String>) -> Gpx {
             lat: fix.lat,
             lon: fix.lon,
             ele_m: Some(fix.alt_m),
-            time: fix.utc.or_else(|| {
-                t.t0.map(|t0| {
-                    t0 + chrono::Duration::microseconds((fix.time * 1e6).round() as i64)
-                })
-            }),
+            // `utc_of` rather than `t0 + fix.time`: `t0` is anchored to the
+            // first sample, not to zero, and on a clip cut from a longer ride
+            // the two are minutes apart. The merge dates its slots the same
+            // way, so a track written here and one merged from the same
+            // telemetry agree on when each fix happened.
+            time: fix.utc.or_else(|| t.utc_of(fix.time)),
             hdop: fix.dop,
             speed_ms: Some(fix.speed_2d),
             course_deg: fix.course_deg,
@@ -235,6 +252,7 @@ pub fn from_telemetry(t: &Telemetry, name: Option<String>) -> Gpx {
             at_sensor_limit: false,
             source: Some(fix.source.as_str().to_string()),
             video_time_s: Some(fix.time),
+            segment: 0,
         });
     }
 
@@ -245,5 +263,6 @@ pub fn from_telemetry(t: &Telemetry, name: Option<String>) -> Gpx {
         time: points.first().and_then(|p| p.time),
         points,
         metadata: Vec::new(),
+        warnings: Vec::new(),
     }
 }
