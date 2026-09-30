@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ffmpeg::{encoders, Encoder, Ffmpeg, Kind, Preset};
+use crate::ffmpeg::{encoders, file_url, Encoder, Ffmpeg, Kind, Preset};
 use crate::math::*;
 
 /// Frame layout of one `.360` video track.
@@ -77,7 +77,59 @@ impl Geometry {
     }
 }
 
-/// The streams a `.360` carries, discovered rather than assumed.
+/// The streams a file carries, discovered rather than assumed.
+///
+/// This is all a stream-copy cut needs, and it asks nothing of the video's
+/// shape: `gmax clips` works on a single-track `.mp4` exactly as on a `.360`.
+#[derive(Debug, Clone, Default)]
+pub struct Streams {
+    /// Every video track, in track order.
+    pub video: Vec<usize>,
+    /// The first video track's frame size.
+    pub video_size: Option<(u32, u32)>,
+    /// The stereo AAC track.
+    pub audio: Option<usize>,
+    /// The four-channel ambisonic PCM track.
+    pub ambisonic: Option<usize>,
+    /// The GPMF telemetry track.
+    pub gpmd: Option<usize>,
+    /// Timecode tracks, which are dropped from cut clips.
+    pub timecode: Vec<usize>,
+    pub frame_rate: f64,
+}
+
+/// List a file's streams, without judging whether it can be stitched.
+pub fn probe_streams(ff: &Ffmpeg, path: &Path) -> anyhow::Result<Streams> {
+    let mut out = Streams {
+        frame_rate: 30000.0 / 1001.0,
+        ..Default::default()
+    };
+    for s in ff.streams(path)? {
+        match s.codec_type.as_str() {
+            "video" => {
+                if let (Some(w), Some(h), None) = (s.width, s.height, out.video_size) {
+                    out.video_size = Some((w, h));
+                    if let Some(r) = s.frame_rate {
+                        out.frame_rate = r;
+                    }
+                }
+                out.video.push(s.index);
+            }
+            "audio" => match s.channels {
+                // Four channels or more is the ambisonic track.
+                Some(c) if c >= 4 => out.ambisonic = out.ambisonic.or(Some(s.index)),
+                _ if s.codec_name == "aac" => out.audio = out.audio.or(Some(s.index)),
+                _ => {}
+            },
+            _ if s.codec_tag == "gpmd" => out.gpmd = Some(s.index),
+            _ if s.codec_tag == "tmcd" => out.timecode.push(s.index),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// What a `.360` needs to be stitched: its streams, and a strip geometry.
 #[derive(Debug, Clone)]
 pub struct Layout {
     /// Both HEVC strips, in track order.
@@ -94,64 +146,34 @@ pub struct Layout {
     pub frame_rate: f64,
 }
 
-/// Inspect a `.360` and work out what is in it.
+/// Inspect a `.360` and work out how to stitch it.
 ///
 /// The second video track's index is not stable — 4 on one clip, 5 on another,
 /// depending on how many audio tracks the camera wrote — so nothing here may be
-/// hardcoded.
+/// hardcoded. Stricter than [`probe_streams`]: a file that is not two lens
+/// strips is refused here, because stitching it would be meaningless.
 pub fn inspect(ff: &Ffmpeg, path: &Path) -> anyhow::Result<Layout> {
-    let streams = ff.streams(path)?;
-    let mut video = Vec::new();
-    let mut audio = None;
-    let mut ambisonic = None;
-    let mut gpmd = None;
-    let mut timecode = Vec::new();
-    let mut geometry = None;
-    let mut frame_rate = 30000.0 / 1001.0;
-
-    for s in &streams {
-        match s.codec_type.as_str() {
-            "video" => {
-                if let (Some(w), Some(h)) = (s.width, s.height) {
-                    if geometry.is_none() {
-                        geometry = Some(Geometry::derive(w, h)?);
-                        if let Some(r) = s.frame_rate {
-                            frame_rate = r;
-                        }
-                    }
-                }
-                video.push(s.index);
-            }
-            "audio" => match s.channels {
-                // Four channels or more is the ambisonic track.
-                Some(c) if c >= 4 => ambisonic = ambisonic.or(Some(s.index)),
-                _ if s.codec_name == "aac" => audio = audio.or(Some(s.index)),
-                _ => {}
-            },
-            _ if s.codec_tag == "gpmd" => gpmd = Some(s.index),
-            _ if s.codec_tag == "tmcd" => timecode.push(s.index),
-            _ => {}
-        }
-    }
-
-    let geometry = geometry
+    let streams = probe_streams(ff, path)?;
+    let (w, h) = streams
+        .video_size
         .ok_or_else(|| anyhow::anyhow!("{} has no video track", path.display()))?;
-    if video.len() < 2 {
+    let geometry = Geometry::derive(w, h)?;
+    if streams.video.len() < 2 {
         anyhow::bail!(
             "{} has {} video track(s); a GoPro .360 has two, one strip per lens. A file already \
              stitched to equirectangular cannot be stitched again.",
             path.display(),
-            video.len()
+            streams.video.len()
         );
     }
     Ok(Layout {
-        video,
-        audio,
-        ambisonic,
-        gpmd,
-        timecode,
+        video: streams.video,
+        audio: streams.audio,
+        ambisonic: streams.ambisonic,
+        gpmd: streams.gpmd,
+        timecode: streams.timecode,
         geometry,
-        frame_rate,
+        frame_rate: streams.frame_rate,
     })
 }
 
@@ -294,7 +316,15 @@ fn wrap_degrees(d: f64) -> f64 {
 }
 
 /// Mean gravity over a clip, straight from the GPMF track.
-pub fn mean_gravity(path: &Path) -> anyhow::Result<(Vec3, usize)> {
+///
+/// `window` is `(start, duration)` in seconds of video, as given to
+/// `--ss`/`--duration`. When a segment is rendered it must be levelled by the
+/// gravity of that segment: the whole ride's mean is a compromise across every
+/// mount shift and every hill, and can be degrees off for any one stretch.
+pub fn mean_gravity(
+    path: &Path,
+    window: Option<(f64, Option<f64>)>,
+) -> anyhow::Result<(Vec3, usize)> {
     use crate::fourcc::FourCc;
     let mut file = crate::mp4::Mp4::open(path)?;
     let gpmf = crate::gpmf::from_mp4(&mut file)?;
@@ -304,16 +334,43 @@ pub fn mean_gravity(path: &Path) -> anyhow::Result<(Vec3, usize)> {
         .find(|((_, key), _)| *key == FourCc::from_str_lossy("GRAV"))
         .map(|(_, s)| s)
         .ok_or_else(|| anyhow::anyhow!("{} has no GRAV stream", path.display()))?;
-    let n = grav.len();
-    if n == 0 {
+    mean_gravity_in(grav, window)
+}
+
+/// Mean of a `GRAV` series, optionally over one window of video time.
+///
+/// Video time is measured from the series' first sample rather than from its
+/// absolute timestamps: a clip cut by a stream copy keeps its parent's GPMF
+/// timestamps, so its first sample may say 1098 s while its video starts at 0.
+pub fn mean_gravity_in(
+    grav: &crate::gpmf::Series,
+    window: Option<(f64, Option<f64>)>,
+) -> anyhow::Result<(Vec3, usize)> {
+    if grav.is_empty() {
         anyhow::bail!("the GRAV stream is empty");
     }
+    let t0 = grav.times[0];
+    let (from, to) = match window {
+        Some((start, duration)) => (start, duration.map_or(f64::INFINITY, |d| start + d)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
     let mut sum = [0.0f64; 3];
-    for i in 0..n {
+    let mut n = 0usize;
+    for i in 0..grav.len() {
+        let t = grav.times[i] - t0;
+        if t < from || t >= to {
+            continue;
+        }
         let s = grav.sample(i);
         for k in 0..3 {
             sum[k] += s[k];
         }
+        n += 1;
+    }
+    if n == 0 {
+        anyhow::bail!(
+            "no gravity samples fall inside the requested segment ({from:.3} s to {to:.3} s)"
+        );
     }
     Ok((scale(&sum, 1.0 / n as f64), n))
 }
@@ -322,10 +379,11 @@ pub fn mean_gravity(path: &Path) -> anyhow::Result<(Vec3, usize)> {
 ///
 /// Each split face is reassembled from four crops: the two outer segments, and
 /// the two halves of the duplicated-angle band, which are cross-faded so the
-/// fisheye seam disappears. `format=yuv444p` comes *before* the geometric
-/// transform deliberately — it keeps the resampling's intermediate precision off
-/// the 4:2:0 chroma grid, where it would otherwise be visible as colour
-/// fringing along the seams.
+/// fisheye seam disappears. The conversion to 4:4:4 (`work_fmt`, see
+/// [`working_format`]) comes *before* the geometric transform deliberately — it
+/// keeps the resampling's intermediate precision off the 4:2:0 chroma grid,
+/// where it would otherwise be visible as colour fringing along the seams.
+#[allow(clippy::too_many_arguments)]
 pub fn filter_graph(
     layout: &Layout,
     out_w: u32,
@@ -333,6 +391,7 @@ pub fn filter_graph(
     rotation: Rotation,
     rorder: &str,
     interp: &str,
+    work_fmt: &str,
     hw_upload: Option<&str>,
 ) -> String {
     let g = layout.geometry;
@@ -346,7 +405,7 @@ pub fn filter_graph(
     // the whole face in the middle.
     for (t, &idx) in layout.video.iter().take(2).enumerate() {
         parts.push(format!(
-            "[0:{idx}]format=yuv444p,split=9{}",
+            "[0:{idx}]format={work_fmt},split=9{}",
             (0..9).map(|s| format!("[t{t}_{s}]")).collect::<String>()
         ));
     }
@@ -467,17 +526,37 @@ pub fn container_for(encoder: &Encoder, audio: Audio) -> &'static str {
     }
 }
 
-/// Assemble the ffmpeg command line for a conversion.
-pub fn convert_args(
+/// The pixel format the stitch works in, before the encoder sees it.
+///
+/// Always 4:4:4, for the reason [`filter_graph`] gives, and 10-bit whenever
+/// the output is: a graph that ran at 8 bits and was then widened to `p010le`
+/// would be an 8-bit picture in a 10-bit file, banding and all. An 8-bit
+/// encoder (or a JPEG preview, `None`) keeps the cheaper 8-bit path.
+pub fn working_format(encoder: Option<&Encoder>) -> &'static str {
+    match encoder {
+        Some(e) if encoders::is_high_bit_depth(e) => "yuv444p10le",
+        _ => "yuv444p",
+    }
+}
+
+/// The part of a stitch's command line shared by a render and a preview: the
+/// inputs, the seek and the filter graph, mapped to `[vout]`.
+///
+/// `chapters` is a second input, and it has to be given here: every option
+/// after the last `-i` belongs to the output, so an input added after the
+/// `-map` would swallow it as an input option and fail.
+fn stitch_args(
     layout: &Layout,
     input: &Path,
-    output: &Path,
-    encoder: &Encoder,
+    chapters: Option<&Path>,
+    encoder: Option<&Encoder>,
     vaapi_device: Option<&Path>,
     opts: &ConvertOptions,
 ) -> Vec<String> {
     let (out_w, out_h) = opts.size.unwrap_or_else(|| layout.geometry.native_output());
-    let vaapi = encoder.name.ends_with("_vaapi");
+    // Only a real encode can use VAAPI; a preview's JPEG is written from
+    // system memory, and an uploaded frame would have nowhere to go.
+    let vaapi = encoder.filter(|e| e.name.ends_with("_vaapi"));
     let graph = filter_graph(
         layout,
         out_w,
@@ -485,7 +564,8 @@ pub fn convert_args(
         opts.rotation.unwrap_or_default(),
         &opts.rorder,
         &opts.interp,
-        vaapi.then_some(encoder.pix_fmt),
+        working_format(encoder),
+        vaapi.map(|e| e.pix_fmt),
     );
 
     let mut a: Vec<String> = vec!["-hide_banner".into()];
@@ -499,40 +579,66 @@ pub fn convert_args(
     if let Some(j) = opts.jobs {
         a.extend(["-filter_threads".into(), j.to_string()]);
     }
-    if let Some(dev) = vaapi_device {
-        if vaapi {
-            a.extend(["-vaapi_device".into(), dev.display().to_string()]);
-        }
+    if let (Some(dev), Some(_)) = (vaapi_device, vaapi) {
+        a.extend(["-vaapi_device".into(), dev.display().to_string()]);
     }
-    // Seeking before -i is an input seek, which snaps to a keyframe but avoids
-    // decoding everything up to that point.
+    // Seeking before -i is an input seek: ffmpeg jumps to the keyframe before
+    // the instant and then decodes and discards up to it, so a transcode
+    // starts on exactly the requested frame without decoding the whole run-in.
     if let Some(ss) = opts.start_s {
         a.extend(["-ss".into(), format!("{ss:.3}")]);
     }
     if let Some(t) = opts.duration_s {
         a.extend(["-t".into(), format!("{t:.3}")]);
     }
-    a.extend(["-i".into(), input.display().to_string()]);
-
-    let chapter_input = opts.chapters.is_some();
-    if let Some(ch) = &opts.chapters {
-        a.extend(["-i".into(), ch.display().to_string()]);
+    a.extend(["-i".into(), file_url(input)]);
+    if let Some(ch) = chapters {
+        a.extend(["-i".into(), file_url(ch)]);
     }
-
     a.extend(["-filter_complex".into(), graph]);
     a.extend(["-map".into(), "[vout]".into()]);
+    a
+}
 
+/// Assemble the ffmpeg command line for a one-frame JPEG preview.
+///
+/// No encoder is involved, so a preview needs neither the encoder survey nor
+/// any hardware: it is meant to be the quick way to check framing.
+pub fn preview_args(layout: &Layout, input: &Path, output: &Path, opts: &ConvertOptions) -> Vec<String> {
+    let mut a = stitch_args(layout, input, None, None, None, opts);
+    // One frame, as a JPEG; nothing else is mapped.
+    a.extend([
+        "-frames:v".into(),
+        "1".into(),
+        "-q:v".into(),
+        "2".into(),
+        file_url(output),
+    ]);
+    a
+}
+
+/// Assemble the ffmpeg command line for a conversion.
+pub fn convert_args(
+    layout: &Layout,
+    input: &Path,
+    output: &Path,
+    encoder: &Encoder,
+    vaapi_device: Option<&Path>,
+    opts: &ConvertOptions,
+) -> Vec<String> {
     if opts.preview {
-        // One frame, as a JPEG; nothing else is mapped.
-        a.extend([
-            "-frames:v".into(),
-            "1".into(),
-            "-q:v".into(),
-            "2".into(),
-            output.display().to_string(),
-        ]);
-        return a;
+        return preview_args(layout, input, output, opts);
     }
+    let vaapi = encoder.name.ends_with("_vaapi");
+    let chapter_input = opts.chapters.is_some();
+    let mut a = stitch_args(
+        layout,
+        input,
+        opts.chapters.as_deref(),
+        Some(encoder),
+        vaapi_device,
+        opts,
+    );
 
     match opts.audio {
         Audio::Stereo | Audio::Both => {
@@ -587,7 +693,7 @@ pub fn convert_args(
         a.extend(["-c:a".into(), "copy".into()]);
     }
     a.extend(["-movflags".into(), "+faststart".into()]);
-    a.push(output.display().to_string());
+    a.push(file_url(output));
     a
 }
 
@@ -605,7 +711,7 @@ pub fn convert_args(
 /// longer than asked. Trimming to the exact frame would mean re-encoding, which
 /// would defeat the point.
 pub fn clip_args(
-    layout: &Layout,
+    timecode: &[usize],
     input: &Path,
     output: &Path,
     start_s: f64,
@@ -618,13 +724,13 @@ pub fn clip_args(
         "-ss".into(),
         format!("{start_s:.3}"),
         "-i".into(),
-        input.display().to_string(),
+        file_url(input),
         "-t".into(),
         format!("{duration_s:.3}"),
         "-map".into(),
         "0".into(),
     ]);
-    for i in &layout.timecode {
+    for i in timecode {
         a.extend(["-map".into(), format!("-0:{i}")]);
     }
     a.extend([
@@ -635,13 +741,14 @@ pub fn clip_args(
         "-avoid_negative_ts".into(),
         "make_zero".into(),
         // Forced because the MP4 muxer rejects the ambisonic channel layout,
-        // and a clip keeps every stream. The .360 extension is retained so the
-        // clip is still recognisably a GoPro dual-lens file.
+        // and a clip keeps every stream; the input's own extension is kept, so
+        // a .360 clip is still recognisably a GoPro dual-lens file. The format
+        // cannot be guessed from a .360 name in any case.
         "-f".into(),
         "mov".into(),
         "-write_tmcd".into(),
         "0".into(),
-        output.display().to_string(),
+        file_url(output),
     ]);
     a
 }
@@ -684,6 +791,37 @@ pub fn choose_encoder(
             }
         )
     })
+}
+
+/// Resolve which encoder to use, and prove it at the real output size.
+///
+/// The survey proves each hardware encoder at [`crate::ffmpeg::PROBE_SIZE`].
+/// A larger output — the original MAX stitches to 5376x2688 — can exceed what
+/// an encoder accepts, H.264 hardware in particular stopping at 4096 wide, and
+/// that would otherwise surface only once ffmpeg starts. So a hardware choice
+/// is re-tested at the real size, one frame, and passed over if it fails.
+pub fn choose_encoder_for_size(
+    ff: &Ffmpeg,
+    survey: &encoders::Survey,
+    opts: &ConvertOptions,
+    (w, h): (u32, u32),
+) -> anyhow::Result<&'static Encoder> {
+    let (pw, ph) = crate::ffmpeg::PROBE_SIZE;
+    let mut survey = survey.clone();
+    loop {
+        let e = choose_encoder(&survey, opts)?;
+        if e.kind == Kind::Cpu || (w <= pw && h <= ph) || ff.test_encoder_at(e, w, h) {
+            return Ok(e);
+        }
+        if opts.encoder.is_some() {
+            anyhow::bail!(
+                "{} works here but could not encode a {w}x{h} frame, which is likely past its \
+                 size limit. Pass a smaller --size or another --encoder.",
+                e.name
+            );
+        }
+        survey.set_status(e.name, encoders::Status::Unusable);
+    }
 }
 
 /// Facts about the source needed to tag the output.
@@ -756,6 +894,9 @@ pub fn tag_spherical(
             args.push(format!("-XMP-photoshop:DateCreated={stamp}"));
         }
     }
+    // exiftool would read a file name beginning with '-' as an option; after
+    // "--" everything is a file.
+    args.push("--".into());
     args.push(output.display().to_string());
 
     let out = std::process::Command::new(exiftool)

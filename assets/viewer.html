@@ -739,7 +739,9 @@ trc.addEventListener('pointercancel', () => scrubbing = false);
    Playback controls
    ===================================================================== */
 const $play = el('play'), $seek = el('seek'), $dur = el('dur'), $mute = el('mute');
-const FRAME = 1001/30000;
+// One frame of this video. The server reads the real rate from the container
+// (/info.json); 29.97, the GoPro's own, is only the fallback.
+let FRAME = 1001/30000;
 
 $play.onclick = () => vid.paused ? vid.play() : vid.pause();
 vid.addEventListener('play',  () => $play.textContent = '❚❚ Pause');
@@ -842,6 +844,33 @@ function tick(){
   requestAnimationFrame(tick);
 }
 
+/* The caption under the controls, as text and <kbd> nodes only. A CSV
+   source has no clip name (T.clip is null), so the telemetry file is named
+   instead, or nothing. */
+function renderNote(T, info){
+  const note = el('note');
+  note.replaceChildren();
+  const text = s => note.append(document.createTextNode(s));
+  const kbd = s => { const k = document.createElement('kbd'); k.textContent = s; note.append(k); };
+  const name = T.clip || info.telemetry;
+  text((name ? `${name} — ` : '') +
+    `${T.n} samples at ${Number(T.hz).toFixed(5)} Hz (${T.hz_note}); ` +
+    `GPS fix ${T.gps_fix_pct}% of samples. ` +
+    (T.video_dur_s && T.video_dur_s < T.dur_s - 1
+      ? `Video covers the first ${T.video_dur_s.toFixed(0)} s of ` +
+        `${T.dur_s.toFixed(0)} s of telemetry. `
+      : '') +
+    `Lean, yaw rate and lateral g are sign-corrected (+ = right-hand turn); ` +
+    `the CSV has them inverted. Nudge with `);
+  kbd('['); text(' '); kbd(']');
+  text(' (a frame) or ');
+  kbd('shift'); text('+'); kbd('['); text(' '); kbd(']');
+  text(' (a second); ');
+  kbd('←'); text(' '); kbd('→');
+  text(' step the video, '); kbd('space');
+  text(' plays. Offset, trim and rate persist in this browser.');
+}
+
 async function boot(){
   if(!initGL()){
     msg.textContent = 'This browser has no WebGL, so the 360 view cannot render.';
@@ -867,19 +896,15 @@ async function boot(){
   el('flipLateral').checked = A.flipLateral;
   showHz();
 
-  el('note').innerHTML =
-    `${T.clip} — ${T.n} samples at ${T.hz.toFixed(5)} Hz ` +
-    `(${T.hz_note}); GPS fix ${T.gps_fix_pct}% of samples. ` +
-    (T.video_dur_s && T.video_dur_s < T.dur_s - 1
-      ? `Video covers the first ${T.video_dur_s.toFixed(0)} s of ` +
-        `${T.dur_s.toFixed(0)} s of telemetry. `
-      : '') +
-    `Lean, yaw rate and lateral g are sign-corrected (+ = right-hand turn); ` +
-    `the CSV has them inverted. ` +
-    `Nudge with <kbd>[</kbd> <kbd>]</kbd> (a frame) or ` +
-    `<kbd>shift</kbd>+<kbd>[</kbd> <kbd>]</kbd> (a second); ` +
-    `<kbd>←</kbd> <kbd>→</kbd> step the video, <kbd>space</kbd> plays. ` +
-    `Offset, trim and rate persist in this browser.`;
+  // The caption is built from DOM nodes, never innerHTML: the clip name is a
+  // file name, and a file can be named "<img src=x onerror=...>.360".
+  let info = {};
+  try{
+    const ir = await fetch('info.json');
+    if(ir.ok) info = await ir.json();
+  }catch(_){ /* optional: the defaults below stand in */ }
+  if(info.fps > 0) FRAME = 1 / info.fps;
+  renderNote(T, info);
 
   vid.src = 'video';
   vid.muted = true;

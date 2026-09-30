@@ -244,3 +244,140 @@ fn hand_cuts_need_no_telemetry_and_share_one_manifest() {
     assert_eq!(manifest["clips"].as_array().unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A scratch directory unique to one test in this run.
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("gmax-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Two lens strips shaped like a .360's (3 x 32 px faces + 2 x 4 px overlap).
+fn synthetic_360(path: &std::path::Path) {
+    let made = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=104x32:rate=10:duration=3"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=104x32:rate=10:duration=3"])
+        .args(["-map", "0", "-map", "1", "-c:v", "mpeg4", "-g", "10", "-f", "mov"])
+        .arg(path)
+        .status()
+        .expect("run ffmpeg");
+    assert!(made.success(), "could not build the synthetic input");
+}
+
+#[test]
+fn a_single_track_mp4_can_be_cut_by_time() {
+    if common::which("ffmpeg").is_none() {
+        eprintln!("SKIP: ffmpeg is not installed");
+        return;
+    }
+    // One video track and no strip geometry: an ordinary .mp4, or a stitched
+    // rendering. A stream copy needs neither two lenses nor a cubemap.
+    let dir = scratch("mp4cut");
+    let input = dir.join("ride.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc=size=128x64:rate=10:duration=4"])
+        .args(["-c:v", "mpeg4", "-g", "10"])
+        .arg(&input)
+        .status()
+        .expect("run ffmpeg");
+    assert!(made.success());
+
+    let out = run(&["clips", input.to_str().unwrap(), "--ss", "1", "--duration", "1.5"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the cut failed: {err}");
+    // An .mp4 stays an .mp4, as a .360 stays a .360.
+    let clip = dir.join("ride_clips").join("ride_cut_t0001_1p5s.mp4");
+    assert!(clip.exists(), "{} was not written", clip.display());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_command_writes_over_its_own_input() {
+    let dir = scratch("selfwrite");
+    let input = dir.join("ride.360");
+    let original = b"stand-in for an irreplaceable recording";
+    std::fs::write(&input, original).unwrap();
+    let same = input.to_str().unwrap().to_string();
+    // Spelled differently, resolving to the same file.
+    let respelled = dir.join(".").join("ride.360").to_str().unwrap().to_string();
+
+    for args in [
+        vec!["telemetry", &same, "-o", &respelled],
+        vec!["telemetry", &same, "--no-csv", "--json", &same],
+        vec!["gpx", &same, "-o", &respelled],
+        vec!["convert", &same, "-o", &respelled, "--dry-run"],
+        vec!["merge", &same, "--with", &same, "-o", &same],
+    ] {
+        let out = run(&args);
+        assert!(!out.status.success(), "{args:?} was allowed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("it is the input file"), "{args:?}: {err}");
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_preview_stitches_one_frame_to_an_oddly_named_file() {
+    if common::which("ffmpeg").is_none() {
+        eprintln!("SKIP: ffmpeg is not installed");
+        return;
+    }
+    let dir = scratch("preview");
+    // A colon would read as a protocol and a leading dash as an option.
+    let input = dir.join("-ride:1.360");
+    synthetic_360(&input);
+    let output = dir.join("-look:1.jpg");
+    let out = Command::new(binary())
+        .current_dir(&dir)
+        // `--out=` and `--` get the names past clap; the point is ffmpeg.
+        .args(["convert", "--preview", "--out=-look:1.jpg", "--", "-ride:1.360"])
+        .output()
+        .expect("run gmax");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the preview failed: {err}");
+    let jpeg = std::fs::read(&output).expect("the preview was not written");
+    assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "not a JPEG");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_dry_run_quotes_the_ffmpeg_path_too() {
+    let Some(ffmpeg) = common::which("ffmpeg") else {
+        eprintln!("SKIP: ffmpeg is not installed");
+        return;
+    };
+    if cfg!(windows) {
+        return;
+    }
+    let dir = scratch("dryrun");
+    let input = dir.join("ride.360");
+    synthetic_360(&input);
+    // Where Windows and many macOS users keep tools: a path with a space.
+    let tools = dir.join("my tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let linked = tools.join("ffmpeg");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&ffmpeg, &linked).unwrap();
+
+    let out = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "--dry-run",
+        "--accel",
+        "cpu",
+        "--ffmpeg",
+        linked.to_str().unwrap(),
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with(&format!("'{}' ", linked.display())),
+        "the program path was not quoted: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -585,3 +585,52 @@ pub fn with_extension(path: &std::path::Path, ext: &str) -> PathBuf {
     p.set_extension(ext);
     p
 }
+
+/// Refuse to write `output` when it is the very file `input` names.
+///
+/// `-o` makes this one typo away — `gmax gpx ride.360 -o ride.360` — and the
+/// cost is the recording itself, which nothing can regenerate. The comparison
+/// is by what the paths resolve to rather than how they are spelled, so
+/// `./ride.360`, `a/../ride.360` and a symlink to it are all caught; an output
+/// that does not exist yet is resolved through its parent directory.
+pub fn refuse_to_overwrite(input: &std::path::Path, output: &std::path::Path) -> anyhow::Result<()> {
+    if same_file(input, output) {
+        anyhow::bail!(
+            "refusing to write {}: it is the input file, and writing it would destroy the \
+             recording. Choose another output path.",
+            output.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether two paths name the same file. `b` need not exist.
+pub fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::path::Path;
+    let Ok(ca) = std::fs::canonicalize(a) else {
+        // An input that does not exist cannot be overwritten.
+        return false;
+    };
+    if let Ok(cb) = std::fs::canonicalize(b) {
+        // Both exist. On a case-insensitive volume two spellings can resolve
+        // to different strings and still be one file, so ask the filesystem.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let (Ok(ma), Ok(mb)) = (std::fs::metadata(&ca), std::fs::metadata(&cb)) {
+                return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+            }
+        }
+        return ca == cb;
+    }
+    let Some(name) = b.file_name() else {
+        return false;
+    };
+    let parent = b
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::canonicalize(parent)
+        .map(|p| p.join(name) == ca)
+        .unwrap_or(false)
+}

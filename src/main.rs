@@ -39,9 +39,9 @@ fn cmd_viewer(args: &gmax::cli::ViewerArgs) -> Result<()> {
     // from what is in the clip — `gmax clips` leaves the ride's calibration
     // beside each clip for exactly this reason. Which one was used is always
     // announced, so preferring it is never silent.
-    let json = if let Some(path) = &args.telemetry {
+    let (json, source) = if let Some(path) = &args.telemetry {
         eprintln!("gmax: telemetry from {}", path.display());
-        telemetry_json_from(path, args.max_dop, Some(&args.video))?
+        (telemetry_json_from(path, args.max_dop, Some(&args.video))?, path.clone())
     } else {
         // A stitched proxy has no telemetry of its own and its stem carries a
         // suffix the sibling's does not, so look under both spellings.
@@ -55,16 +55,18 @@ fn cmd_viewer(args: &gmax::cli::ViewerArgs) -> Result<()> {
         match sibling {
             Some(p) => {
                 eprintln!("gmax: telemetry from {}", p.display());
-                telemetry_json_from(&p, args.max_dop, Some(&args.video))?
+                (telemetry_json_from(&p, args.max_dop, Some(&args.video))?, p)
             }
             None => {
                 eprintln!("gmax: telemetry from the track inside {}", args.video.display());
-                telemetry_json_from(&args.video, args.max_dop, Some(&args.video)).map_err(|e| {
-                    e.context(
-                        "no telemetry found: pass --telemetry, or run `gmax telemetry` on the \
-                         original .360 first",
-                    )
-                })?
+                let json = telemetry_json_from(&args.video, args.max_dop, Some(&args.video))
+                    .map_err(|e| {
+                        e.context(
+                            "no telemetry found: pass --telemetry, or run `gmax telemetry` on \
+                             the original .360 first",
+                        )
+                    })?;
+                (json, args.video.clone())
             }
         }
     };
@@ -72,9 +74,23 @@ fn cmd_viewer(args: &gmax::cli::ViewerArgs) -> Result<()> {
     gmax::viewer::serve(gmax::viewer::Options {
         video: args.video.clone(),
         telemetry_json: json,
+        telemetry_source: source.file_name().map(|s| s.to_string_lossy().to_string()),
+        fps: video_frame_rate(&args.video),
         port: args.port,
         open_browser: !args.no_open,
     })
+}
+
+/// The video's frame rate, from its own sample table.
+///
+/// Read from the container rather than assumed, so the viewer's frame step is
+/// one frame of *this* video: 29.97 for the Max 2, but 25, 50 or 60 for a
+/// proxy or another camera. `None` for a file this reader cannot open, and
+/// the page falls back to 29.97.
+fn video_frame_rate(video: &std::path::Path) -> Option<f64> {
+    let file = gmax::mp4::Mp4::open(video).ok()?;
+    let track = file.tracks_by_handler("vide").into_iter().next()?;
+    track.mean_sample_duration().map(|d| 1.0 / d)
 }
 
 /// `GS010527_proxy.mp4` -> `GS010527.telemetry.csv`.
@@ -340,13 +356,18 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
     }
 
     let ff = Ffmpeg::find(args.ffmpeg.as_deref())?;
-    let layout = gmax::render::inspect(&ff, &args.input)?;
+    // Only the stream list: a stream copy does not care what shape the video
+    // is, so a single-track .mp4 cuts exactly like a two-strip .360.
+    let streams = gmax::render::probe_streams(&ff, &args.input)?;
+    require_utf8(&args.input)?;
+    require_utf8(&outdir)?;
     std::fs::create_dir_all(&outdir)
         .with_context(|| format!("creating {}", outdir.display()))?;
 
     let mut written = Vec::new();
     for c in &planned {
         let path = outdir.join(format!("{}.{ext}", c.name(&stem)));
+        gmax::cli::refuse_to_overwrite(&args.input, &path)?;
         if path.exists() && !args.overwrite {
             if !quiet {
                 println!("skipping {} (already exists)", path.display());
@@ -355,7 +376,7 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
             continue;
         }
         let cmd = gmax::render::clip_args(
-            &layout,
+            &streams.timecode,
             &args.input,
             &path,
             c.start_s,
@@ -466,12 +487,19 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
     use gmax::ffmpeg::{encoders, Ffmpeg, Kind, Preset};
     use gmax::render::{self, Audio, ConvertOptions, Rotation};
 
+    if let Some(out) = &args.out {
+        gmax::cli::refuse_to_overwrite(&args.input, out)?;
+    }
+
     // The rotation comes from the telemetry, so it is known before ffmpeg is
     // needed at all -- which is why --print-rotation works without it.
     let mut rotation = if let Some(spec) = &args.rotate {
         Some(Rotation::parse(spec)?)
     } else if args.level || args.print_rotation {
-        let (mean, n) = render::mean_gravity(&args.input)?;
+        // A segment is levelled by its own gravity, not the whole ride's.
+        let window = (args.ss.is_some() || args.duration.is_some())
+            .then(|| (args.ss.unwrap_or(0.0), args.duration));
+        let (mean, n) = render::mean_gravity(&args.input, window)?;
         let r = render::level_from_gravity(mean)?;
         if !quiet && !args.print_rotation {
             println!("levelling from {n} gravity samples: {r}");
@@ -543,16 +571,23 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
         overwrite: args.overwrite,
     };
 
-    let survey = encoders::survey(&ff, args.reprobe);
-    let encoder = render::choose_encoder(&survey, &opts)?;
+    let (w, h) = opts.size.unwrap_or_else(|| layout.geometry.native_output());
+
+    // A preview is a JPEG: no encoder, so no survey, which is most of what
+    // would otherwise make the quick check slow.
+    let encoder = if args.preview {
+        None
+    } else {
+        let survey = encoders::survey(&ff, args.reprobe);
+        Some(render::choose_encoder_for_size(&ff, &survey, &opts, (w, h))?)
+    };
 
     let output = match &args.out {
         Some(p) => p.clone(),
         None => {
-            let ext = if args.preview {
-                "jpg"
-            } else {
-                render::container_for(encoder, opts.audio)
+            let ext = match encoder {
+                None => "jpg",
+                Some(e) => render::container_for(e, opts.audio),
             };
             let stem = args
                 .input
@@ -563,12 +598,27 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
                 .with_file_name(format!("{stem}_equirect.{ext}"))
         }
     };
+    gmax::cli::refuse_to_overwrite(&args.input, &output)?;
+    require_utf8(&args.input)?;
+    require_utf8(&output)?;
+    // ffmpeg's -n declines an existing output but still exits successfully,
+    // and the spherical tagging after it would then rewrite the old file. So
+    // the check is made here, where it can stop everything.
+    if output.exists() && !args.overwrite && !args.dry_run {
+        anyhow::bail!(
+            "{} already exists; pass --overwrite to replace it",
+            output.display()
+        );
+    }
 
     // Chapters are written in the source's time base, so a trimmed output needs
     // them shifted; ffmpeg takes the timestamps literally.
     let mut opts = opts;
-    let _shifted_chapters; // keeps the temporary file alive until ffmpeg has run
+    // Deletes the shifted copy when this function returns, however it returns;
+    // it only has to outlive the ffmpeg run.
+    let mut _shifted_chapters: Option<TempFile> = None;
     if let Some(path) = &opts.chapters {
+        require_utf8(path)?;
         if opts.start_s.is_some() || opts.duration_s.is_some() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -577,12 +627,12 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
                 opts.start_s.unwrap_or(0.0),
                 opts.duration_s,
             );
-            let temp = std::env::temp_dir().join(format!(
+            let temp = TempFile(std::env::temp_dir().join(format!(
                 "gmax-chapters-{}.txt",
                 std::process::id()
-            ));
-            std::fs::write(&temp, &shifted)
-                .with_context(|| format!("writing {}", temp.display()))?;
+            )));
+            std::fs::write(&temp.0, &shifted)
+                .with_context(|| format!("writing {}", temp.0.display()))?;
             if !quiet {
                 let kept = shifted.matches("[CHAPTER]").count();
                 let total = text.matches("[CHAPTER]").count();
@@ -591,38 +641,39 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
                      start at zero"
                 );
             }
-            opts.chapters = Some(temp.clone());
+            opts.chapters = Some(temp.0.clone());
             _shifted_chapters = Some(temp);
-        } else {
-            _shifted_chapters = None;
         }
-    } else {
-        _shifted_chapters = None;
     }
 
-    let vaapi = ff.vaapi_device();
-    let cmd = render::convert_args(
-        &layout,
-        &args.input,
-        &output,
-        encoder,
-        vaapi.as_deref(),
-        &opts,
-    );
+    let cmd = match encoder {
+        None => render::preview_args(&layout, &args.input, &output, &opts),
+        Some(e) => render::convert_args(
+            &layout,
+            &args.input,
+            &output,
+            e,
+            ff.vaapi_device().as_deref(),
+            &opts,
+        ),
+    };
 
     if args.dry_run {
-        println!("{} {}", ff.ffmpeg.display(), shell_join(&cmd));
+        println!("{}", shell_join(&ff.ffmpeg.display().to_string(), &cmd));
         return Ok(());
     }
 
     let (w, h) = opts.size.unwrap_or_else(|| layout.geometry.native_output());
     if !quiet {
-        println!(
-            "stitching {} to {w}x{h} with {} ({})",
-            args.input.display(),
-            encoder.name,
-            encoder.kind.as_str()
-        );
+        match encoder {
+            Some(e) => println!(
+                "stitching {} to {w}x{h} with {} ({})",
+                args.input.display(),
+                e.name,
+                e.kind.as_str()
+            ),
+            None => println!("previewing {} at {w}x{h}", args.input.display()),
+        }
     }
     ff.run_streaming(&cmd)?;
 
@@ -653,20 +704,85 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// A temporary file that is deleted when it goes out of scope.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Refuse a path that is not valid Unicode, before ffmpeg mangles it.
+///
+/// The ffmpeg command line is assembled as text, so such a path would reach
+/// ffmpeg with replacement characters in it and fail as "no such file" —
+/// or, for an output, be written under a name nobody asked for.
+fn require_utf8(path: &std::path::Path) -> Result<()> {
+    if path.to_str().is_none() {
+        anyhow::bail!(
+            "{} is not valid Unicode, which gmax cannot pass to ffmpeg; rename it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Quote a command for display, so a dry run can be pasted into a shell.
-fn shell_join(args: &[String]) -> String {
-    args.iter()
+///
+/// The program is quoted too: an ffmpeg under `C:\Program Files` or
+/// `~/My Tools` is the norm, not the exception. POSIX shells get single
+/// quotes; on Windows the quoting is the one the C runtime's argument parser
+/// undoes, which is what ffmpeg.exe will see.
+fn shell_join(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
         .map(|a| {
-            if a.chars()
-                .all(|c| c.is_alphanumeric() || "-_./:=+".contains(c))
-            {
-                a.clone()
+            if cfg!(windows) {
+                quote_windows(a)
             } else {
-                format!("'{}'", a.replace('\'', "'\\''"))
+                quote_posix(a)
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn quote_posix(a: &str) -> String {
+    if !a.is_empty() && a.chars().all(|c| c.is_alphanumeric() || "-_./:=+".contains(c)) {
+        a.to_string()
+    } else {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    }
+}
+
+/// Quote one argument by the MSVC runtime's rules: wrap in double quotes,
+/// escape an embedded quote with a backslash, and double any backslashes that
+/// precede a quote (including the closing one), since only those are special.
+fn quote_windows(a: &str) -> String {
+    if !a.is_empty() && !a.chars().any(|c| c.is_whitespace() || "\"&|<>^%!()".contains(c)) {
+        return a.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+    for c in a.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
 }
 
 fn cmd_encoders(args: &gmax::cli::EncodersArgs) -> Result<()> {
@@ -899,6 +1015,9 @@ fn cmd_merge(args: &gmax::cli::MergeArgs, quiet: bool) -> Result<()> {
     use gmax::cli::PreferArg;
     use gmax::merge;
 
+    gmax::cli::refuse_to_overwrite(&args.base, &args.out_path())?;
+    gmax::cli::refuse_to_overwrite(&args.external, &args.out_path())?;
+
     let external = gmax::gpx::read_file(&args.external)
         .with_context(|| format!("reading {}", args.external.display()))?;
     if external.points.is_empty() {
@@ -986,6 +1105,7 @@ fn cmd_merge(args: &gmax::cli::MergeArgs, quiet: bool) -> Result<()> {
 }
 
 fn cmd_gpx(args: &gmax::cli::GpxArgs, quiet: bool) -> Result<()> {
+    gmax::cli::refuse_to_overwrite(&args.input, &args.gpx_path())?;
     let mut file = gmax::mp4::Mp4::open(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let gpmf = gmax::gpmf::from_mp4(&mut file)?;
@@ -1018,6 +1138,12 @@ fn cmd_gpx(args: &gmax::cli::GpxArgs, quiet: bool) -> Result<()> {
 }
 
 fn cmd_telemetry(args: &gmax::cli::TelemetryArgs, quiet: bool) -> Result<()> {
+    if !args.no_csv {
+        gmax::cli::refuse_to_overwrite(&args.input, &args.csv_path())?;
+    }
+    if let Some(json) = args.json_path() {
+        gmax::cli::refuse_to_overwrite(&args.input, &json)?;
+    }
     let mut file = gmax::mp4::Mp4::open(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let gpmf = gmax::gpmf::from_mp4(&mut file)?;
@@ -1061,4 +1187,30 @@ fn cmd_telemetry(args: &gmax::cli::TelemetryArgs, quiet: bool) -> Result<()> {
         print!("{}", telemetry::output::summary(&t));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quote_posix, quote_windows};
+
+    #[test]
+    fn posix_quoting_survives_spaces_and_quotes() {
+        assert_eq!(quote_posix("plain/path.mp4"), "plain/path.mp4");
+        assert_eq!(quote_posix("/my tools/ffmpeg"), "'/my tools/ffmpeg'");
+        assert_eq!(quote_posix("it's"), "'it'\\''s'");
+        assert_eq!(quote_posix(""), "''");
+    }
+
+    #[test]
+    fn windows_quoting_follows_the_c_runtime_rules() {
+        assert_eq!(quote_windows(r"C:\ffmpeg\bin\ffmpeg.exe"), r"C:\ffmpeg\bin\ffmpeg.exe");
+        assert_eq!(
+            quote_windows(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+            r#""C:\Program Files\ffmpeg\bin\ffmpeg.exe""#
+        );
+        // Backslashes are literal except before a quote, where they double.
+        assert_eq!(quote_windows(r#"a "b""#), r#""a \"b\"""#);
+        assert_eq!(quote_windows(r"dir with space\"), r#""dir with space\\""#);
+        assert_eq!(quote_windows(""), r#""""#);
+    }
 }

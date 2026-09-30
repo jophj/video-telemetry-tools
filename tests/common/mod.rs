@@ -42,6 +42,10 @@ pub fn fixture(rel: &str) -> Option<PathBuf> {
 }
 
 /// Resolve a fixture or print a skip note and return.
+///
+/// Every test crate compiles this module, and most never call the macro, so
+/// the allowances keep them from each warning about it.
+#[allow(unused_macros)]
 macro_rules! fixture_or_skip {
     ($rel:expr) => {
         match crate::common::fixture($rel) {
@@ -53,6 +57,7 @@ macro_rules! fixture_or_skip {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use fixture_or_skip;
 
 pub fn which(name: &str) -> Option<PathBuf> {

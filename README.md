@@ -12,7 +12,7 @@ gmax telemetry <in.360> [-o out.csv] [--json]
 gmax gpx       <in.360> [-o out.gpx]
 gmax merge     <base.360|base.gpx> --with external.gpx [-o merged.gpx]
 gmax analyse   <video|csv|gpx> [--json] [--chapters F] [--edl F] [--cues F]
-gmax clips     <in.360> [--top N] [--metric LIST] | [--ss S [--duration S]]
+gmax clips     <in.360|in.mp4> [--top N] [--metric LIST] | [--ss S [--duration S]]
 gmax viewer    <video> [--telemetry F] [--port 8360]
 gmax encoders  [--accel gpu|cpu]
 ```
@@ -60,11 +60,15 @@ crops four pieces per split face and cross-fades the middle two.
 Output defaults to the native angular resolution — four cube faces across,
 3840×1920 for the Max 2. Colour conversion happens *before* the geometric
 transform, which keeps the resampling's intermediate precision off the 4:2:0
-chroma grid where it would show as fringing along the seams, and the output is
-10-bit where the encoder supports it.
+chroma grid where it would show as fringing along the seams. When the encoder
+is 10-bit the whole stitch runs at 10 bits (`yuv444p10le`), so the output is
+10-bit in fact and not just in its label; an 8-bit encoder keeps the cheaper
+8-bit path. `--preview` writes one JPEG and needs no encoder at all, so it
+skips the encoder survey.
 
 `--level` derives a rotation from the clip's mean gravity vector so the horizon
-comes out level. `--heading D` then turns the view about the vertical to choose
+comes out level — over just the rendered segment when `--ss`/`--duration`
+select one, since the whole ride's mean can be degrees off for any one stretch. `--heading D` then turns the view about the vertical to choose
 what the centre of the frame looks at; the two are independent.
 
 The GPMF telemetry track is copied into the output by default, so `gmax
@@ -76,6 +80,11 @@ rather than a very wide, very distorted rectangle: YouTube, VLC and every
 headset decide whether to offer spherical navigation by looking for Google's
 `GSpherical` XMP block, and ffmpeg does not write it. That step needs exiftool;
 without it the render still succeeds and says what is missing.
+
+No command will write over its own input: an `-o` (or a derived output) that
+resolves to the source file, however it is spelled, is refused before anything
+is written. Paths are handed to ffmpeg as `file:` URLs, so a name that starts
+with `-` or contains a colon is still just a file.
 
 ### `telemetry` — rider channels as CSV or JSON
 
@@ -184,7 +193,9 @@ decision list and a cue-sheet CSV from the same set of windows.
 
 Lossless stream copies keeping both lenses, both audio tracks and the
 telemetry, so a clip can be stitched or analysed exactly like the original. A
-manifest records which moment chose each clip.
+manifest records which moment chose each clip. A stream copy asks nothing of
+the video's shape, so an ordinary single-track `.mp4` cuts just as well; each
+clip keeps its source's extension.
 
 A stream copy can only begin at a keyframe, so a clip starts at or before the
 requested instant and may run a little longer. Trimming to the frame would mean
@@ -250,14 +261,29 @@ trace, on `127.0.0.1:8360`. Telemetry comes from an explicit `--telemetry`
 file, the video's own GPMF track, or a sibling CSV — the last because a viewer
 is usually pointed at a stitched or proxy rendering, which has none of its own.
 
+Frame stepping uses the video's own frame rate, read from its container. The
+server answers only requests addressed to it by its loopback name and port, so
+a web page cannot reach it by rebinding its own domain to `127.0.0.1`, and
+each request is served on its own thread, so a stalled video download never
+holds up the page.
+
 ### `encoders` — what this machine can actually do
 
 **Which encoders an ffmpeg build exposes says nothing about which ones the
 machine can run.** The same binary advertises `hevc_nvenc` with no NVIDIA card
 and `h264_qsv` with no Intel GPU, and both fail only once the real encode
 starts — an hour into a 25-minute stitch. So every hardware encoder is
-verified with a one-frame test encode, and the verdicts are cached against the
-ffmpeg version banner.
+verified with a one-frame test encode, fed the way the real encode feeds it:
+at 3840×1920, in the encoder's own pixel format and profile (10-bit
+`main10` for HEVC). A larger output, like the original MAX's 5376×2688, gets
+the chosen encoder re-tested at its real size just before the render, which
+catches H.264 hardware and its 4096-pixel width limit.
+
+The verdicts are cached against the ffmpeg binary itself — its version banner,
+canonical path, size and modification time — so a different or upgraded
+ffmpeg re-probes automatically. A hardware failure is only believed for an
+hour, since a busy GPU or a driver not yet loaded is often a passing state;
+`--reprobe` still forces a full re-test.
 
 A `--quality` preset is therefore a *candidate list*, not a fixed encoder: the
 first one that works here wins.
