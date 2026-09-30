@@ -149,8 +149,10 @@ fn out_of_order_points_are_sorted_defensively() {
 
 #[test]
 fn hostile_text_cannot_break_out_of_the_document() {
-    let mut g = Gpx::default();
-    g.name = Some(r#"Ride </name></metadata><script>alert("x")</script> & 'quoted'"#.to_string());
+    let mut g = Gpx {
+        name: Some(r#"Ride </name></metadata><script>alert("x")</script> & 'quoted'"#.to_string()),
+        ..Default::default()
+    };
     g.points.push(TrackPoint {
         lat: 44.1,
         lon: 11.2,
