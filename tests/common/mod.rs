@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod sections;
+
 /// The GoPro Max 2 reference clip: 8.55 GB, 25:38, MAX2, firmware H24.02.01.30.00.
 pub const REFERENCE_360: &str = "sources/GS010527.360";
 
