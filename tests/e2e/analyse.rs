@@ -232,8 +232,6 @@ fn chapters_edl_and_cues_are_written_and_parse() {
 }
 
 #[test]
-#[ignore = "fixed on fix/review-2: analyse's --merge-gap does not accept a negative value \
-            (clap reads -1 as a flag), though its help says negative disables merging"]
 fn a_negative_merge_gap_disables_merging() {
     let video = section_or_skip!("corner_sequence");
     let dir = Scratch::new("analyse-merge-gap");
