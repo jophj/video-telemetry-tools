@@ -493,9 +493,62 @@ cargo build --release
 cargo test --release
 ```
 
-Tests that need the reference footage skip cleanly when it is absent, so
-`cargo test` passes on a fresh clone and reports what it could not run. Put
-material in `sources/` to enable them; the reference CSV is regenerated with
+### Testing
+
+`cargo test` runs three layers:
+
+- **Unit tests** inside `src/`.
+- **Integration tests** in `tests/*.rs`, against the library and the CLI
+  surface (`tests/cli.rs`). Most need nothing; the ones that read the whole
+  reference recording skip without it.
+- **End-to-end tests** in `tests/e2e/`, which run the real `gmax` binary —
+  `telemetry`, `gpx`, `analyse`, `clips`, `merge`, `convert`, `viewer` — on
+  short sections of the reference ride and check what it writes. All output
+  goes to a temporary directory, never into `sources/`.
+
+The reference is 8.55 GB, too big and slow to push through every test, so the
+end-to-end suite works on seven windows of it, 8 to 16 s each, chosen from the
+ride's own telemetry for what they exercise: GPS acquisition, the hardest
+corner, a right-left pair, a 159 km/h straight, a GPS dropout the phone's
+track fills, a mount slip, and the end of the file. The catalogue, with the
+measured figures behind each choice, is in `tests/common/sections.rs`.
+
+Each section is cut on first use into `sources/sections/<name>.360` by ffmpeg
+directly — a lossless stream copy with the same arguments `gmax clips` uses,
+but not through `gmax`, so the fixture does not depend on the code under test.
+About 440 MB in all, gitignored with the rest of `sources/`, and reused from
+then on. To cut them all up front:
+
+```sh
+cargo test --test e2e -- --ignored cut_all_sections
+```
+
+Sections are compared against the whole ride's telemetry, which is generated
+once per run from the reference (it reads only the GPMF track, so it takes
+seconds) and cached as `sources/sections/parent.telemetry.csv`, rebuilt
+whenever the `gmax` binary is newer than it. Once the sections are cut the
+suite runs in a few seconds.
+
+**Goldens.** `tests/golden/<section>.json` holds a compact summary of each
+section — sample and fix counts, lean peaks and the sign decision, peak loads,
+the top moment of every metric, the clips `clips` would plan — compared with
+explicit per-field tolerances. A deliberate change is accepted by re-blessing
+them and reviewing the diff:
+
+```sh
+GMAX_BLESS=1 cargo test --test e2e golden
+```
+
+**What is skipped.** Without the reference recording (and with no sections
+already cut) every end-to-end test prints `SKIP` and passes, so `cargo test`
+passes on a fresh clone and says what it could not run. An existing section is
+used even when the reference is absent. Checks that need a tool degrade the
+same way: cutting and `clips`/`convert` need ffmpeg and ffprobe, the
+spherical-metadata check needs exiftool, and GPX schema validation needs
+`xmllint` and the GPX 1.1 schema (`GPX_XSD` in `tests/common/mod.rs`, or
+`GMAX_GPX_XSD=path`). Set `GMAX_KEEP_SCRATCH=1` to keep a test's output.
+
+The prototype's reference CSV, used by the parity tests, is regenerated with
 
 ```sh
 python3 prototypes/gopro-telemetry.py sources/GS010527.360 \
