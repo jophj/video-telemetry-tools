@@ -674,3 +674,19 @@ time_s,utc,lat,lon,speed_kmh,lean_deg
     let a = moments::analyse(&s, &Options::default()).unwrap();
     assert!(!a.has_absolute_clock());
 }
+
+#[test]
+fn chapters_are_shifted_in_their_own_timebase() {
+    // One chapter at 1/90000 and one with no TIMEBASE at all, which ffmpeg
+    // reads as milliseconds.
+    let text = ";FFMETADATA1\n\n\
+        [CHAPTER]\nTIMEBASE=1/90000\nSTART=900000\nEND=1800000\ntitle=ten to twenty\n\n\
+        [CHAPTER]\nSTART=30000\nEND=40000\ntitle=thirty to forty\n";
+    // The segment runs 15..35 s.
+    let out = gmax::moments::clips::shift_ffmetadata(text, 15.0, Some(20.0));
+    assert_eq!(out.matches("[CHAPTER]").count(), 2, "got:\n{out}");
+    // 10..20 s trimmed to 15..20 s, rebased to 0..5 s, still at 1/90000.
+    assert!(out.contains("TIMEBASE=1/90000\nSTART=0\nEND=450000\n"), "got:\n{out}");
+    // 30..40 s trimmed to 30..35 s, rebased to 15..20 s, in milliseconds.
+    assert!(out.contains("START=15000\nEND=20000\n"), "got:\n{out}");
+}

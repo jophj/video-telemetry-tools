@@ -212,7 +212,12 @@ pub struct GpsFix {
     pub lat: f64,
     pub lon: f64,
     pub alt_m: f64,
+    /// Ground speed in m/s. NaN when unknown: a merge that revives a rejected
+    /// fix with a position from elsewhere may have no speed to give it, and
+    /// the camera's own was as wrong as its position. Read it through
+    /// [`Telemetry::speed_at`], or filter on `is_finite`.
     pub speed_2d: f64,
+    /// As `speed_2d`, and NaN on any fix a merge revived.
     pub speed_3d: f64,
     pub dop: Option<f64>,
     /// 0 = none, 2 = 2D, 3 = 3D. `None` for the older `GPS5` stream, which does
@@ -462,8 +467,11 @@ impl Telemetry {
         self.fix_at(i).filter(|f| f.valid)
     }
 
+    /// Ground speed at master sample `i`, when the fix in effect is usable
+    /// and its speed known. A merge can revive a fix with a position and no
+    /// speed to go with it, which it records as NaN.
     pub fn speed_at(&self, i: usize) -> Option<f64> {
-        self.valid_fix_at(i).map(|f| f.speed_2d)
+        self.valid_fix_at(i).map(|f| f.speed_2d).filter(|v| v.is_finite())
     }
 
     /// A sub-range of this telemetry, carrying its calibration.
@@ -550,6 +558,19 @@ impl Telemetry {
         (from.min(self.n), to.min(self.n))
     }
 
+    /// The sample range covering `[start_s, end_s]` in seconds of video.
+    ///
+    /// [`range_covering`](Self::range_covering) for a window planned against
+    /// the video -- a clip, a `--ss`/`--duration` -- which has to be moved onto
+    /// the GPMF's own timeline first; see [`raw_time_of`](Self::raw_time_of).
+    /// Empty on an empty source.
+    pub fn video_range(&self, start_s: f64, end_s: f64) -> (usize, usize) {
+        match (self.raw_time_of(start_s), self.raw_time_of(end_s)) {
+            (Some(a), Some(b)) => self.range_covering(a, b),
+            _ => (0, 0),
+        }
+    }
+
     /// Absolute time at a point on this source's own timeline.
     ///
     /// Measured from `times[0]`, which is what `t0` is anchored to, and not
@@ -564,7 +585,7 @@ impl Telemetry {
     /// to measure from.
     pub fn utc_of(&self, time_s: f64) -> Option<DateTime<Utc>> {
         let t0 = self.t0?;
-        let micros = ((time_s - self.times.first()?) * 1e6).round() as i64;
+        let micros = (self.video_time_of(time_s)? * 1e6).round() as i64;
         Some(t0 + chrono::Duration::microseconds(micros))
     }
 
@@ -581,6 +602,18 @@ impl Telemetry {
     /// clip's run-in, and the price of one rule that is right for both.
     pub fn video_time_of(&self, time_s: f64) -> Option<f64> {
         Some(time_s - self.times.first()?)
+    }
+
+    /// The point on this source's own timeline at `video_s` seconds into the
+    /// video: the inverse of [`video_time_of`](Self::video_time_of).
+    ///
+    /// Everything planned against the video -- moments, clips, a hand-cut
+    /// window -- is in video time, and everything read off the GPMF is not.
+    /// The two differ by the whole cut-in point on a clip stream-copied out
+    /// of a longer recording, so mixing them up is not a rounding error but
+    /// eighteen minutes.
+    pub fn raw_time_of(&self, video_s: f64) -> Option<f64> {
+        Some(video_s + self.times.first()?)
     }
 
     /// Absolute time of master sample `i`.
@@ -710,11 +743,22 @@ impl Telemetry {
 /// for sample — which is what makes the parent's calibration transferable
 /// rather than merely approximate.
 pub fn timeline(gpmf: &Gpmf) -> Option<Vec<f64>> {
-    let series = gpmf.series();
-    let device_id = pick_device(&series);
-    series
-        .get(&(device_id, FourCc::from_str_lossy("GRAV")))
-        .map(|s| s.times.clone())
+    device_series(gpmf, "GRAV").map(|s| s.times)
+}
+
+/// The device [`compute`] reads its telemetry from.
+///
+/// A dual-lens camera emits one `DEVC` per lens and only one carries the full
+/// IMU set, so anything reading a stream on its own must choose the same one
+/// `compute` does, or it can read the other lens's copy of it. Decided from
+/// sample counts, so no series has to be built to decide it.
+pub fn main_device(gpmf: &Gpmf) -> u32 {
+    pick_device(gpmf.sample_counts())
+}
+
+/// One stream of the main device (see [`main_device`]), built on its own.
+pub fn device_series(gpmf: &Gpmf, key: &str) -> Option<Series> {
+    gpmf.series_of(main_device(gpmf), FourCc::from_str_lossy(key))
 }
 
 /// Compute rider channels from a parsed GPMF stream.
@@ -724,7 +768,7 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
 
     // Pick the device with the richest set of streams. Dual-lens cameras emit
     // one DEVC per lens and only one of them carries the full IMU set.
-    let device_id = pick_device(&series);
+    let device_id = pick_device(series.iter().map(|(k, s)| (*k, s.len())));
     let get = |key: &str| -> Option<&Series> { series.get(&(device_id, FourCc::from_str_lossy(key))) };
     let device_name = series
         .iter()
@@ -768,7 +812,23 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
 
     // Position. Absent GPS is a warning, not a failure: lean and the IMU
     // channels are still perfectly good without it.
-    let (mut gps, gps_key) = match (get("GPS9"), get("GPS5")) {
+    // A stream too narrow for its own layout is malformed, and indexing its
+    // fields would panic; it is skipped as if absent, which lets a broken GPS9
+    // fall back to a sound GPS5.
+    let mut wide_enough = |key: &str, need: usize| {
+        get(key).filter(|s| {
+            let ok = s.components >= need;
+            if !ok {
+                warnings.push(format!(
+                    "{key} has {} values per sample where {need} are needed; it is ignored",
+                    s.components
+                ));
+            }
+            ok
+        })
+    };
+    let (gps9, gps5) = (wide_enough("GPS9", GPS9_FIELDS), wide_enough("GPS5", GPS5_MIN_FIELDS));
+    let (mut gps, gps_key) = match (gps9, gps5) {
         (Some(s), _) => {
             if !gps9_reports_fix(s) {
                 warnings.push(
@@ -1716,8 +1776,10 @@ fn build_gps_index(times: &[f64], gps: &[GpsFix]) -> Vec<Option<usize>> {
 /// So: if the recording ever reports a non-zero `fix`, the camera populates the
 /// field and it is used. If it is uniformly zero, it carries no information and
 /// is ignored, with a note in the quality report.
+///
+/// The caller checks the stream has [`GPS9_FIELDS`] values per sample.
 fn parse_gps9(s: &Series, opts: &Options) -> Vec<GpsFix> {
-    let fix_populated = (0..s.len()).any(|i| s.sample(i)[8] > 0.0);
+    let fix_populated = gps9_reports_fix(s);
 
     let mut out = Vec::with_capacity(s.len());
     for i in 0..s.len() {
@@ -1757,6 +1819,13 @@ fn parse_gps9(s: &Series, opts: &Options) -> Vec<GpsFix> {
     out
 }
 
+/// Values per `GPS9` sample.
+const GPS9_FIELDS: usize = 9;
+
+/// The fewest values a `GPS5` sample can have and still be a position. The
+/// remaining fields are optional and read as zero when missing.
+const GPS5_MIN_FIELDS: usize = 2;
+
 /// True when a `GPS9` stream actually populates its fix-type field.
 fn gps9_reports_fix(s: &Series) -> bool {
     (0..s.len()).any(|i| s.sample(i)[8] > 0.0)
@@ -1766,6 +1835,9 @@ fn gps9_reports_fix(s: &Series) -> bool {
 ///
 /// It reports neither DOP nor fix type, so only a null position can be
 /// rejected outright, and there is no telemetry clock to anchor absolute time.
+///
+/// The caller checks the stream has at least [`GPS5_MIN_FIELDS`] values per
+/// sample.
 fn parse_gps5(s: &Series, opts: &Options) -> Vec<GpsFix> {
     let mut out = Vec::with_capacity(s.len());
     for i in 0..s.len() {
@@ -2001,9 +2073,9 @@ fn course_rate(gps: &[GpsFix]) -> Vec<f64> {
 }
 
 /// Choose the device whose streams look most complete.
-fn pick_device(series: &BTreeMap<(u32, FourCc), Series>) -> u32 {
+fn pick_device(counts: impl IntoIterator<Item = ((u32, FourCc), usize)>) -> u32 {
     let mut score: BTreeMap<u32, usize> = BTreeMap::new();
-    for ((dev, key), s) in series {
+    for ((dev, key), len) in counts {
         // Weight the streams the computation actually needs.
         let w = match key.as_bytes() {
             b"GRAV" => 100,
@@ -2011,8 +2083,8 @@ fn pick_device(series: &BTreeMap<(u32, FourCc), Series>) -> u32 {
             b"ACCL" | b"GYRO" => 20,
             _ => 1,
         };
-        if !s.is_empty() {
-            *score.entry(*dev).or_default() += w;
+        if len > 0 {
+            *score.entry(dev).or_default() += w;
         }
     }
     score

@@ -284,7 +284,7 @@ pub fn slots_from_telemetry(t: &Telemetry) -> Vec<Slot> {
                 ele_m: Some(fix.alt_m),
                 time: Some(time),
                 hdop: fix.dop,
-                speed_ms: Some(fix.speed_2d),
+                speed_ms: Some(fix.speed_2d).filter(|v| v.is_finite()),
                 course_deg: fix.course_deg,
                 ..Default::default()
             }),
@@ -341,9 +341,15 @@ pub fn slots_from_gpx(base: &Gpx) -> Vec<Slot> {
             let steps = (gap / cadence).round() as i64;
             if gap > cadence * 2.5 && gap <= MAX_FILL_GAP_S && steps <= MAX_FILL_SLOTS {
                 for s in 1..steps {
+                    let elapsed = Duration::milliseconds((s as f64 * cadence * 1000.0) as i64);
                     slots.push(Slot {
-                        time: prev + Duration::milliseconds((s as f64 * cadence * 1000.0) as i64),
-                        video_time_s: None,
+                        time: prev + elapsed,
+                        // The video runs on through a gap in the fixes, so a
+                        // slot inside one is as far into the video as it is
+                        // past the point before. Without it, a position
+                        // substituted here could not be placed in the video,
+                        // and `analyse --chapters` dropped every one.
+                        video_time_s: timed[k - 1].video_time_s.map(|v| v + secs(elapsed)),
                         fix: None,
                         lean_deg: None,
                         accel_ms2: None,
@@ -378,7 +384,9 @@ pub fn slots_from_gpx(base: &Gpx) -> Vec<Slot> {
 /// were repaired; see [`apply_to_fixes`] for what else changes.
 pub fn apply_to_telemetry(t: &mut Telemetry, merged: &Gpx) -> usize {
     let clocked = t.t0.is_some();
-    let origin = t.times.first().copied().unwrap_or(0.0);
+    // Where the video starts on the GPMF timeline, which slot video times
+    // are measured from.
+    let origin = t.raw_time_of(0.0).unwrap_or(0.0);
     apply_to_fixes(&mut t.gps, origin, clocked, merged)
 }
 
@@ -405,25 +413,11 @@ pub fn apply_to_fixes(fixes: &mut [GpsFix], origin: f64, clocked: bool, merged: 
     let fix_times: Vec<f64> = fixes.iter().map(|f| f.time - origin).collect();
     let mut placed = vec![false; fixes.len()];
     let mut repaired = 0;
-    for p in &merged.points {
+    for (k, p) in merged.points.iter().enumerate() {
         let Some(vt) = p.video_time_s else { continue };
-        // The nearest fix either side, then whichever is closer. Half a fix
-        // interval is the most a correctly matched point can be away.
-        let i = fix_times.partition_point(|&x| x < vt);
-        let cand = [i.checked_sub(1), (i < fix_times.len()).then_some(i)];
-        let Some(j) = cand
-            .into_iter()
-            .flatten()
-            .min_by(|&a, &b| {
-                (fix_times[a] - vt)
-                    .abs()
-                    .partial_cmp(&(fix_times[b] - vt).abs())
-                    .unwrap()
-            })
-            .filter(|&j| (fix_times[j] - vt).abs() < 0.05)
-        else {
-            continue;
-        };
+        // Half a fix interval is the most a correctly matched point can be
+        // away.
+        let Some(j) = nearest_within(&fix_times, vt, 0.05) else { continue };
         placed[j] = true;
         let fix = &mut fixes[j];
         // A position interpolated across the camera's own rejected fixes is
@@ -432,20 +426,41 @@ pub fn apply_to_fixes(fixes: &mut [GpsFix], origin: f64, clocked: bool, merged: 
         if p.source.as_deref() == Some("interpolated") && !fix.valid {
             continue;
         }
+        let source = match p.source.as_deref() {
+            Some("external") => Source::External,
+            Some("interpolated") => Source::Interpolated,
+            _ => Source::Gopro,
+        };
         fix.lat = p.lat;
         fix.lon = p.lon;
         if let Some(e) = p.ele_m {
             fix.alt_m = e;
         }
-        if let Some(s) = p.speed_ms {
-            fix.speed_2d = s;
+        // The speed a rejected fix reported is as unsound as its position, so
+        // reviving it with a good position and its own speed made a usable
+        // fix with a nonsense speed, which then ranked as the ride's fastest
+        // moment. It takes the merged point's speed, else one measured from
+        // the merged positions either side, else none at all. A fix the
+        // camera trusted keeps its own speed when the merged point has none.
+        match p.speed_ms.filter(|v| v.is_finite()) {
+            Some(v) => fix.speed_2d = v,
+            None if !fix.valid => {
+                fix.speed_2d = speed_from_neighbours(&merged.points, k).unwrap_or(f64::NAN);
+            }
+            None => {}
+        }
+        if !fix.valid {
+            // No source reports a vertical speed to put in its place.
+            fix.speed_3d = f64::NAN;
+        }
+        // Likewise its DOP, the 99.99 sentinel on a fix rejected for want of
+        // a lock, which describes a position that is no longer there. An
+        // external position carries its own source's precision, or none.
+        if source == Source::External || !fix.valid {
+            fix.dop = p.hdop;
         }
         fix.course_deg = p.course_deg;
-        fix.source = match p.source.as_deref() {
-            Some("external") => Source::External,
-            Some("interpolated") => Source::Interpolated,
-            _ => Source::Gopro,
-        };
+        fix.source = source;
         if !fix.valid {
             repaired += 1;
         }
@@ -460,6 +475,22 @@ pub fn apply_to_fixes(fixes: &mut [GpsFix], origin: f64, clocked: bool, merged: 
         }
     }
     repaired
+}
+
+/// Ground speed at merged point `k`, measured from the positions either side.
+///
+/// For a point whose source reported none. Central where it can be, one-sided
+/// at an end, and refused across more than a few seconds, where a straight
+/// line between the two positions would cut every corner in between. Also
+/// refused at an unpositioned stretch of the merged track, which leaves the
+/// neighbours far apart in time.
+fn speed_from_neighbours(points: &[TrackPoint], k: usize) -> Option<f64> {
+    const MAX_SPAN_S: f64 = 3.0;
+    let at = |i: usize| points.get(i).and_then(|p| Some((p, p.time?)));
+    let (a, ta) = k.checked_sub(1).and_then(at).or_else(|| at(k))?;
+    let (b, tb) = at(k + 1).or_else(|| at(k))?;
+    let dt = secs(tb - ta);
+    (dt > 0.0 && dt <= MAX_SPAN_S).then(|| haversine(a.lat, a.lon, b.lat, b.lon) / dt)
 }
 
 /// Merge an external GPX into a base timeline.

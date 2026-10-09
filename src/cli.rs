@@ -401,7 +401,7 @@ pub struct AnalyseArgs {
     pub post: f64,
 
     /// Merge windows that come within this of each other. Negative disables.
-    #[arg(long, default_value_t = 2.0, value_name = "S")]
+    #[arg(long, default_value_t = 2.0, value_name = "S", allow_hyphen_values = true)]
     pub merge_gap: f64,
 
     /// Reject GPS fixes at or above this dilution of precision.
@@ -440,7 +440,9 @@ pub struct MergeArgs {
 
     /// Clock offset in seconds to add to the external timestamps, skipping the
     /// automatic search.
-    #[arg(long, value_name = "S", conflicts_with = "no_align")]
+    ///
+    /// Either sign: the external device's clock may run ahead or behind.
+    #[arg(long, value_name = "S", conflicts_with = "no_align", allow_hyphen_values = true)]
     pub time_offset: Option<f64>,
 
     /// Assume the two clocks already agree.
@@ -452,7 +454,7 @@ pub struct MergeArgs {
     /// A receiver's positions can describe where you were a few seconds ago.
     /// The GoPro Max 2's are stale by about 4.4 s, which at road speed puts
     /// them 70 m behind. Measured automatically by default.
-    #[arg(long, value_name = "S", conflicts_with = "no_gps_lag")]
+    #[arg(long, value_name = "S", conflicts_with = "no_gps_lag", allow_hyphen_values = true)]
     pub gps_lag: Option<f64>,
 
     /// Take the camera's position timestamps at face value.

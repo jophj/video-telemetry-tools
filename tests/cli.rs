@@ -102,6 +102,9 @@ fn negative_numbers_are_accepted_where_they_are_meaningful() {
         vec!["convert", "x.360", "--rotate", "-45:117.9:0", "--dry-run"],
         vec!["convert", "x.360", "--heading", "-90", "--dry-run"],
         vec!["clips", "x.360", "--merge-gap", "-1", "--dry-run"],
+        vec!["analyse", "x.gpx", "--merge-gap", "-1"],
+        vec!["merge", "x.gpx", "--with", "y.gpx", "--time-offset", "-1.5"],
+        vec!["merge", "x.gpx", "--with", "y.gpx", "--gps-lag", "-0.5"],
     ] {
         let out = run(&args);
         let err = String::from_utf8_lossy(&out.stderr);
@@ -111,6 +114,15 @@ fn negative_numbers_are_accepted_where_they_are_meaningful() {
             "{args:?} was rejected by the parser: {err}"
         );
     }
+}
+
+#[test]
+fn the_viewer_refuses_a_gpx_by_name() {
+    // Read as a video, a GPX failed with a complaint about MP4 boxes.
+    let out = run(&["viewer", "v.mp4", "--telemetry", "ride.gpx", "--no-open"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("ride.gpx is a GPX"), "{err}");
 }
 
 #[test]

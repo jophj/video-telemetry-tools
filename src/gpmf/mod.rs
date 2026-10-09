@@ -56,6 +56,20 @@ pub enum GpmfError {
     Empty,
 }
 
+impl GpmfError {
+    /// What went wrong, without saying where: the part two occurrences of
+    /// the same fault in different payloads have in common.
+    fn kind(&self) -> &'static str {
+        match self {
+            GpmfError::TruncatedHeader { .. } => "truncated KLV header",
+            GpmfError::TruncatedPayload { .. } => "truncated KLV data",
+            GpmfError::DataAfterPadding { .. } => "data after padding",
+            GpmfError::ExpectedDevc { .. } => "not a DEVC",
+            GpmfError::Empty => "empty",
+        }
+    }
+}
+
 type Result<T> = std::result::Result<T, GpmfError>;
 
 /// One KLV element's header.
@@ -248,19 +262,20 @@ impl Gpmf {
             for klv in iter.by_ref() {
                 if klv.key.as_bytes() != b"DEVC" {
                     // Not fatal: note it and keep reading this payload.
-                    warnings.push(
+                    context.fault(
+                        "GPMF",
                         GpmfError::ExpectedDevc {
                             payload: index,
                             found: klv.key,
-                        }
-                        .to_string(),
+                        },
+                        &mut warnings,
                     );
                     continue;
                 }
                 devices.push(parse_devc(klv.data, index, &mut context, &mut warnings));
             }
             if let Some(err) = iter.error {
-                warnings.push(err.to_string());
+                context.fault("GPMF", err, &mut warnings);
             }
             payloads.push(Payload {
                 index,
@@ -269,6 +284,8 @@ impl Gpmf {
                 devices,
             });
         }
+
+        context.finish(&mut warnings);
 
         if payloads.is_empty() {
             return Err(GpmfError::Empty);
@@ -282,11 +299,51 @@ impl Gpmf {
     /// Collapse per-payload chunks into one continuous series per
     /// `(device id, key)`.
     pub fn series(&self) -> BTreeMap<(u32, FourCc), Series> {
+        self.collect_series(|_, _| true)
+    }
+
+    /// One `(device id, key)`'s series alone.
+    ///
+    /// For a caller that needs one stream: [`series`](Self::series) builds
+    /// every one, and on a camera whose gyro runs at 800 Hz that is most of
+    /// the work and most of the memory.
+    pub fn series_of(&self, device: u32, key: FourCc) -> Option<Series> {
+        self.collect_series(|d, k| d == device && k == key)
+            .into_values()
+            .next()
+    }
+
+    /// How many samples each `(device id, key)` carries, without building any
+    /// series.
+    pub fn sample_counts(&self) -> BTreeMap<(u32, FourCc), usize> {
+        let mut out: BTreeMap<(u32, FourCc), usize> = BTreeMap::new();
+        for device in self.payloads.iter().flat_map(|p| &p.devices) {
+            for chunk in &device.streams {
+                *out.entry((device.id, chunk.key)).or_default() += chunk.len();
+            }
+        }
+        out
+    }
+
+    /// The name a device gives itself in `DVNM`, from the first payload that
+    /// carries one.
+    pub fn device_name(&self, device: u32) -> Option<String> {
+        self.payloads
+            .iter()
+            .flat_map(|p| &p.devices)
+            .filter(|d| d.id == device)
+            .find_map(|d| d.name.clone())
+    }
+
+    fn collect_series(
+        &self,
+        wanted: impl Fn(u32, FourCc) -> bool,
+    ) -> BTreeMap<(u32, FourCc), Series> {
         let mut out: BTreeMap<(u32, FourCc), Series> = BTreeMap::new();
         let mut spans: BTreeMap<(u32, FourCc), Vec<ChunkSpan>> = BTreeMap::new();
         for payload in &self.payloads {
             for device in &payload.devices {
-                for chunk in &device.streams {
+                for chunk in device.streams.iter().filter(|c| wanted(device.id, c.key)) {
                     let entry = out.entry((device.id, chunk.key)).or_insert_with(|| Series {
                         device_id: device.id,
                         device_name: device.name.clone(),
@@ -492,6 +549,9 @@ struct StreamContext {
     /// Warnings already given, so a fault repeated in every payload of a long
     /// recording is reported once rather than fifteen hundred times.
     warned: BTreeSet<String>,
+    /// Malformed KLV seen so far, by kind and place: where its warning sits in
+    /// the list, and how many times it has happened.
+    faults: BTreeMap<String, (usize, usize)>,
 }
 
 #[derive(Default)]
@@ -512,6 +572,36 @@ impl StreamContext {
     fn warn_once_as(&mut self, gist: String, warning: String, warnings: &mut Vec<String>) {
         if self.warned.insert(gist) {
             warnings.push(warning);
+        }
+    }
+
+    /// Report malformed KLV found in `scope`, once per kind of fault there.
+    ///
+    /// A camera that writes one stream wrongly writes it wrongly in every
+    /// payload, and each occurrence names its own payload and offset, so
+    /// without this a damaged stream buried every other warning under fifteen
+    /// hundred near-identical ones. The first occurrence is kept as the
+    /// example, since its payload and offset are where to look; the rest are
+    /// counted, and [`finish`](Self::finish) adds the count.
+    fn fault(&mut self, scope: &str, err: GpmfError, warnings: &mut Vec<String>) {
+        let gist = format!("{scope}: {}", err.kind());
+        match self.faults.get_mut(&gist) {
+            Some((_, count)) => *count += 1,
+            None => {
+                self.faults.insert(gist, (warnings.len(), 1));
+                warnings.push(format!("{scope}: {err}"));
+            }
+        }
+    }
+
+    /// Say how often each fault recurred, on the warning that first reported it.
+    fn finish(&self, warnings: &mut [String]) {
+        for &(at, count) in self.faults.values() {
+            if count > 1 {
+                if let Some(w) = warnings.get_mut(at) {
+                    w.push_str(&format!(" ({count} payloads in all)"));
+                }
+            }
         }
     }
 }
@@ -543,7 +633,7 @@ fn parse_devc(
         }
     }
     if let Some(err) = iter.error {
-        warnings.push(err.to_string());
+        context.fault(&format!("device {id}"), err, warnings);
     }
     Device { id, name, streams }
 }
@@ -582,13 +672,12 @@ fn parse_strm(
                     .collect();
             }
             b"SCAL" => {
-                let (comps, vals) = decode_numeric(klv.kind, klv.sample_size, klv.repeat, klv.data);
-                // SCAL is one divisor per repeat, so flatten either shape.
-                scal = if comps <= 1 {
-                    vals
-                } else {
-                    vals.chunks(comps).map(|c| c[0]).collect()
-                };
+                // SCAL is a list of divisors however it is shaped: N repeats of
+                // one value, or one sample of N components. Both flatten to the
+                // same N. Keeping only each sample's first component made the
+                // second shape a single divisor applied to every field.
+                let (_, vals) = decode_numeric(klv.kind, klv.sample_size, klv.repeat, klv.data);
+                scal = vals;
             }
             b"TYPE" => type_str = Some(decode_text(klv.data)),
             b"TMPC" => {
@@ -630,7 +719,13 @@ fn parse_strm(
         }
     }
     if let Some(err) = iter.error {
-        warnings.push(err.to_string());
+        // Named by its data key when the damage came after it, which is what
+        // tells one broken stream from another on the same device.
+        let scope = match &data {
+            Some((key, ..)) => format!("device {device} {key}"),
+            None => format!("device {device} stream"),
+        };
+        context.fault(&scope, err, warnings);
     }
 
     let (key, kind, sample_size, repeat, raw) = data?;

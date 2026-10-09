@@ -1318,3 +1318,78 @@ fn the_roll_zero_bridges_a_long_corner_sequence_from_the_riding_either_side() {
         assert!((at(t) - want).abs() < 1.0, "zero at {t} s is {:.2}, expected {want}", at(t));
     }
 }
+
+#[test]
+fn a_gps_stream_too_narrow_for_its_layout_is_ignored_rather_than_panicking() {
+    // GPS9 cut down to six values per sample, and GPS5 to one: both would
+    // index past the end of every sample.
+    for (gps, key, keep) in [
+        (synthetic::Gps::Gps9, "GPS9", 6usize),
+        (synthetic::Gps::Gps5, "GPS5", 1usize),
+    ] {
+        let mut g = synthetic::build(&Ride { duration_s: 30.0, gps, ..Ride::default() });
+        for p in &mut g.payloads {
+            for d in &mut p.devices {
+                for c in &mut d.streams {
+                    if c.key.to_string() == key {
+                        let width = c.components;
+                        c.values =
+                            c.values.chunks(width).flat_map(|v| v[..keep].to_vec()).collect();
+                        c.components = keep;
+                    }
+                }
+            }
+        }
+        let t = telemetry::compute(&g, &Default::default()).expect("the IMU channels survive");
+        assert!(t.gps.is_empty(), "{key}: {} fixes", t.gps.len());
+        assert!(
+            t.warnings.iter().any(|w| w.contains(key) && w.contains("values per sample")),
+            "{key}: {:?}",
+            t.warnings
+        );
+        assert_eq!(t.lean_deg.len(), t.n);
+    }
+}
+
+#[test]
+fn a_single_stream_is_read_from_the_device_compute_uses() {
+    // A second device, numbered first, carrying a GRAV of its own and nothing
+    // else: the other lens of a dual-lens camera. Taking the first GRAV in key
+    // order read this one.
+    let mut g = synthetic::build(&Ride { duration_s: 10.0, ..Ride::default() });
+    for p in &mut g.payloads {
+        let mut grav = p.devices[0].streams[0].clone();
+        assert_eq!(grav.key.to_string(), "GRAV");
+        grav.values = vec![9.0; grav.values.len()];
+        let other = gmax::gpmf::Device { id: 0, name: Some("other lens".into()), streams: vec![grav] };
+        p.devices.insert(0, other);
+    }
+    assert_eq!(telemetry::main_device(&g), 1);
+    let grav = telemetry::device_series(&g, "GRAV").expect("a GRAV stream");
+    assert_eq!(grav.device_id, 1);
+    assert_ne!(grav.sample(0), &[9.0, 9.0, 9.0]);
+    assert_eq!(g.device_name(1).as_deref(), Some("synthetic"));
+    // Only the one stream is built, and it matches the full build's copy.
+    assert_eq!(grav.values, g.series()[&(1, grav.key)].values);
+    assert_eq!(telemetry::timeline(&g), Some(grav.times));
+}
+
+#[test]
+fn a_window_in_video_time_is_moved_onto_the_gpmf_timeline() {
+    // A clip cut eighteen minutes in keeps its GPMF timestamps, so its
+    // timeline starts at 1098 s while its video starts at 0. A window planned
+    // against the video must be moved by that much before it names samples.
+    let ride = Ride { duration_s: 30.0, clock_offset_s: 1098.0, ..Ride::default() };
+    let t = synthetic::compute(&ride);
+    let first = t.times[0];
+    assert!(first >= 1098.0);
+    assert_eq!(t.raw_time_of(10.0), Some(first + 10.0));
+    assert_eq!(t.video_time_of(t.raw_time_of(10.0).unwrap()), Some(10.0));
+
+    let (from, to) = t.video_range(10.0, 15.0);
+    assert!(to > from, "the window names no samples");
+    assert!((t.times[from] - first - 10.0).abs() < 0.05, "starts at {}", t.times[from]);
+    assert!((t.times[to - 1] - first - 15.0).abs() < 0.05, "ends at {}", t.times[to - 1]);
+    // Read raw, the same numbers fall before the timeline begins.
+    assert_eq!(t.range_covering(10.0, 15.0), (0, 0));
+}
