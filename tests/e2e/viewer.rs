@@ -131,3 +131,40 @@ fn the_viewer_serves_a_sections_telemetry_and_video_ranges() {
         Some(format!("bytes */{size}").as_str())
     );
 }
+
+#[test]
+fn the_viewer_refuses_a_gpx_as_its_telemetry_by_name() {
+    // Regression: a GPX fell through to the MP4 reader and was refused as
+    // "not an ISO base media file". It has none of the per-frame channels the
+    // viewer plays, so the refusal should say that it is a GPX.
+    let video = section_or_skip!("hard_corner");
+    let Some(phone) = crate::common::fixture(crate::common::REFERENCE_PHONE_GPX) else {
+        eprintln!("SKIP: the phone GPX is not present on this machine");
+        return;
+    };
+    // Spawned with a deadline: if the refusal ever regressed into serving,
+    // the test must fail rather than hang on a server that never exits.
+    let mut child = Command::new(crate::common::sections::gmax_binary())
+        .args(["viewer".as_ref(), video.as_os_str(), "--telemetry".as_ref(), phone.as_os_str()])
+        .args(["--port", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run gmax viewer");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("gmax viewer served a GPX instead of refusing it");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(!status.success());
+    assert!(err.contains("GPX"), "the refusal does not say why: {err}");
+    assert!(!err.contains("ISO base media"), "{err}");
+}

@@ -484,9 +484,20 @@ pub fn apply_to_fixes(fixes: &mut [GpsFix], origin: f64, clocked: bool, merged: 
 /// line between the two positions would cut every corner in between. Also
 /// refused at an unpositioned stretch of the merged track, which leaves the
 /// neighbours far apart in time.
+///
+/// Only neighbours from the same source count. At a join the two sources can
+/// disagree by tens of metres, and measuring across it turned that offset
+/// into speed: the first phone point after the camera's last read 364 km/h
+/// in a 60 km/h corner.
 fn speed_from_neighbours(points: &[TrackPoint], k: usize) -> Option<f64> {
     const MAX_SPAN_S: f64 = 3.0;
-    let at = |i: usize| points.get(i).and_then(|p| Some((p, p.time?)));
+    let source = &points.get(k)?.source;
+    let at = |i: usize| {
+        points
+            .get(i)
+            .filter(|p| &p.source == source)
+            .and_then(|p| Some((p, p.time?)))
+    };
     let (a, ta) = k.checked_sub(1).and_then(at).or_else(|| at(k))?;
     let (b, tb) = at(k + 1).or_else(|| at(k))?;
     let dt = secs(tb - ta);
