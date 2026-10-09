@@ -299,6 +299,37 @@ fn data_after_the_zero_padding_is_reported() {
     assert_eq!(g.series()[&key("ACCL")].len(), 1);
 }
 
+#[test]
+fn scal_written_as_one_multi_component_sample_gives_one_divisor_per_component() {
+    // The same three divisors as three repeats of one value would be, but
+    // written as a single sample of three. Keeping only each sample's first
+    // value made that one divisor, 1, and left Y and Z unscaled.
+    let divisors = [1i16, 10, 100].iter().flat_map(|d| d.to_be_bytes()).collect::<Vec<_>>();
+    let scal = klv(b"SCAL", b's', 6, 1, &divisors);
+    let g = parse(&[devc(1, &[strm(&[scal, accl(&[[5, 50, 500]])])])], 1.0);
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    assert_eq!(g.series()[&key("ACCL")].sample(0), &[5.0, 5.0, 5.0]);
+}
+
+#[test]
+fn a_stream_malformed_in_every_payload_is_reported_once_with_a_count() {
+    // A data element claiming more bytes than its STRM holds, after a sound
+    // ACCL, in each of five payloads. Every occurrence names a different
+    // payload, which is what defeated deduplication by message.
+    let liar = {
+        let mut k = klv(b"GYRO", b's', 6, 1, &i16s(&[[0, 0, 0]]));
+        k[7] = 9; // nine samples claimed, one present
+        k
+    };
+    let payload = devc(1, &[strm(&[accl(&[[1, 2, 3]]), liar])]);
+    let g = parse(&vec![payload; 5], 1.0);
+    assert_eq!(g.warnings.len(), 1, "{:?}", g.warnings);
+    assert!(g.warnings[0].contains("ACCL"), "{:?}", g.warnings);
+    assert!(g.warnings[0].contains("5 payloads in all"), "{:?}", g.warnings);
+    // The samples before the damage are still read.
+    assert_eq!(g.series()[&key("ACCL")].len(), 5);
+}
+
 // -------------------------------------------------------------- MP4 building
 
 fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {

@@ -245,7 +245,7 @@ pub fn from_telemetry(t: &Telemetry, name: Option<String>) -> Gpx {
             // telemetry agree on when each fix happened.
             time: fix.utc.or_else(|| t.utc_of(fix.time)),
             hdop: fix.dop,
-            speed_ms: Some(fix.speed_2d),
+            speed_ms: Some(fix.speed_2d).filter(|v| v.is_finite()),
             course_deg: fix.course_deg,
             lean_deg: Some(t.lean_deg[i]),
             accel_ms2: t.accel_lon_g.as_ref().map(|v| v[i] * crate::math::G),

@@ -1025,7 +1025,9 @@ pub fn samples_from_telemetry(t: &crate::telemetry::Telemetry) -> Vec<Sample> {
         if fix.valid {
             s.pos = Some((fix.lat, fix.lon));
             s.ele_m = Some(fix.alt_m);
-            s.speed_ms = Some(fix.speed_2d);
+            // NaN is a speed nothing could measure (see `merge::apply_to_fixes`),
+            // and ranking it would be ranking nothing.
+            s.speed_ms = Some(fix.speed_2d).filter(|v| v.is_finite());
         }
         out.push(s);
     }

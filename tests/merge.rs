@@ -500,6 +500,121 @@ fn fixes_a_lag_correction_leaves_behind_are_invalidated_not_left_stale() {
     assert!(fixes.iter().any(|f| !f.valid));
 }
 
+/// Camera fixes for a synthetic base, one per slot, timed by video time.
+///
+/// Those inside `rejected` are what the quality gate leaves after losing lock:
+/// invalid, with the DOP sentinel and a speed as wrong as the position.
+fn camera_fixes(
+    slots: &[merge::Slot],
+    rejected: std::ops::Range<f64>,
+) -> Vec<gmax::telemetry::GpsFix> {
+    slots
+        .iter()
+        .map(|s| {
+            let vt = s.video_time_s.unwrap();
+            let lost = rejected.contains(&vt);
+            let f = s.fix.clone().unwrap_or_default();
+            gmax::telemetry::GpsFix {
+                time: vt,
+                lat: f.lat,
+                lon: f.lon,
+                alt_m: 0.0,
+                speed_2d: if lost { 70.0 } else { 11.12 },
+                speed_3d: if lost { 70.0 } else { 11.12 },
+                dop: Some(if lost { 99.99 } else { 1.5 }),
+                fix: None,
+                utc: Some(s.time),
+                course_deg: None,
+                valid: !lost,
+                reject: lost.then_some(gmax::telemetry::Reject::HighDop),
+                source: gmax::telemetry::Source::Gopro,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_revived_fix_takes_its_speed_and_precision_from_the_merge_not_the_camera() {
+    let base = synthetic(300, 10.0, 0.0, 0.0);
+    let mut slots = merge::slots_from_gpx(&base);
+    for (k, s) in slots.iter_mut().enumerate() {
+        s.video_time_s = Some(k as f64 / 10.0);
+        if (10.0..15.0).contains(&(k as f64 / 10.0)) {
+            s.fix = None;
+        }
+    }
+    let mut fixes = camera_fixes(&slots, 10.0..15.0);
+    // A phone track that reports no speed, and an HDOP of its own.
+    let mut external = synthetic(60, 2.0, 0.0, 0.0);
+    for p in &mut external.points {
+        p.speed_ms = None;
+        p.hdop = Some(0.9);
+    }
+    let (merged, _) = merge::merge(&slots, &external, &substitute_only());
+    assert!(merge::apply_to_fixes(&mut fixes, 0.0, true, &merged) > 0);
+
+    let f = &fixes[120];
+    assert!(f.valid);
+    assert_eq!(f.source, gmax::telemetry::Source::External);
+    // Measured from the merged positions either side: the synthetic ride runs
+    // north at 1e-4 degrees a second, 11.1 m/s. Kept, the camera's own 70 m/s
+    // would have been the fastest moment of the ride.
+    assert!((f.speed_2d - 11.12).abs() < 0.2, "speed {}", f.speed_2d);
+    assert!(f.speed_3d.is_nan());
+    assert_eq!(f.dop, Some(0.9), "the DOP sentinel survived");
+    // A fix the camera trusted keeps what it measured.
+    assert_eq!(fixes[50].dop, Some(1.5));
+    assert_eq!(fixes[50].speed_2d, 11.12);
+}
+
+#[test]
+fn a_revived_fix_with_no_speed_to_be_had_says_so_rather_than_keep_the_cameras() {
+    let base = synthetic(30, 10.0, 0.0, 0.0);
+    let mut slots = merge::slots_from_gpx(&base);
+    for (k, s) in slots.iter_mut().enumerate() {
+        s.video_time_s = Some(k as f64 / 10.0);
+    }
+    let mut fixes = camera_fixes(&slots, 1.0..1.05);
+    // One merged point and nothing around it to measure a speed from.
+    let merged = Gpx {
+        points: vec![TrackPoint {
+            lat: 44.5,
+            lon: 11.5,
+            time: Some(slots[10].time),
+            video_time_s: Some(1.0),
+            source: Some("external".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    merge::apply_to_fixes(&mut fixes, 0.0, true, &merged);
+    let f = &fixes[10];
+    assert!(f.valid);
+    assert_eq!((f.lat, f.lon), (44.5, 11.5));
+    assert!(f.speed_2d.is_nan(), "speed {}", f.speed_2d);
+    assert_eq!(f.dop, None);
+}
+
+#[test]
+fn slots_filling_a_gap_in_a_gpx_base_carry_video_time() {
+    // A GPX written by `gmax gpx` has video times on its points, and a gap
+    // where the camera lost lock. A position substituted into the gap needs
+    // one too, or it cannot be placed in the video.
+    let mut base = synthetic(300, 10.0, 0.0, 0.0);
+    for p in &mut base.points {
+        p.video_time_s = Some(seconds(p) + 100.0);
+    }
+    base.points.retain(|p| !(10.0..15.0).contains(&seconds(p)));
+    let slots = merge::slots_from_gpx(&base);
+    let filled: Vec<_> = slots.iter().filter(|s| s.fix.is_none()).collect();
+    assert!(!filled.is_empty());
+    for s in filled {
+        let elapsed = (s.time - t0()).num_milliseconds() as f64 / 1000.0;
+        let vt = s.video_time_s.expect("a filled slot has a video time");
+        assert!((vt - (elapsed + 100.0)).abs() < 1e-3, "{vt} at {elapsed}");
+    }
+}
+
 #[test]
 fn a_bogus_timestamp_does_not_fill_a_year_with_slots() {
     // One point a year late made the gap filler create one empty slot per

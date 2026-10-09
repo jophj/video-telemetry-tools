@@ -325,16 +325,14 @@ pub fn mean_gravity(
     path: &Path,
     window: Option<(f64, Option<f64>)>,
 ) -> anyhow::Result<(Vec3, usize)> {
-    use crate::fourcc::FourCc;
     let mut file = crate::mp4::Mp4::open(path)?;
     let gpmf = crate::gpmf::from_mp4(&mut file)?;
-    let series = gpmf.series();
-    let grav = series
-        .iter()
-        .find(|((_, key), _)| *key == FourCc::from_str_lossy("GRAV"))
-        .map(|(_, s)| s)
+    // The device telemetry reads, so the levelling and the lean angle agree
+    // on which lens's gravity they mean; and only GRAV, not the 800 Hz gyro
+    // alongside it.
+    let grav = crate::telemetry::device_series(&gpmf, "GRAV")
         .ok_or_else(|| anyhow::anyhow!("{} has no GRAV stream", path.display()))?;
-    mean_gravity_in(grav, window)
+    mean_gravity_in(&grav, window)
 }
 
 /// Mean of a `GRAV` series, optionally over one window of video time.
@@ -840,12 +838,13 @@ pub fn source_info(path: &Path) -> SourceInfo {
     };
     let created = file.creation_time;
     // The camera names itself in the GPMF device record: "MAX2" on this camera.
-    let model = crate::gpmf::from_mp4(&mut file).ok().and_then(|g| {
-        g.payloads
-            .first()
-            .and_then(|p| p.devices.first())
-            .and_then(|d| d.name.clone())
-    });
+    // Every payload carries the record, so the first one is read rather than
+    // the whole track, which on a long ride is hundreds of megabytes.
+    let first = file.gpmd_track().and_then(|t| t.samples.first().cloned());
+    let model = first
+        .and_then(|s| file.read_sample(&s).ok())
+        .and_then(|data| crate::gpmf::Gpmf::parse(&data, &[(0, data.len(), 0.0, 1.0)]).ok())
+        .and_then(|g| g.device_name(crate::telemetry::main_device(&g)));
     SourceInfo { model, created }
 }
 

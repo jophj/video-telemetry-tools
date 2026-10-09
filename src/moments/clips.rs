@@ -404,55 +404,15 @@ pub fn write_cue_csv(clips: &[Clip]) -> String {
 /// tiling, so a player will show each one running until the next begins
 /// regardless of the gaps here.
 pub fn shift_ffmetadata(text: &str, start_s: f64, duration_s: Option<f64>) -> String {
-    let start_ms = (start_s * 1000.0).round() as i64;
-    let end_ms = duration_s.map(|d| start_ms + (d * 1000.0).round() as i64);
-
     let mut out = String::new();
     // A chapter block accumulates until its bounds are known, then is emitted
     // or discarded as a whole.
     let mut block: Vec<String> = Vec::new();
     let mut in_chapter = false;
-    let mut chapter_start: Option<i64> = None;
-    let mut chapter_end: Option<i64> = None;
-
-    let flush = |out: &mut String,
-                 block: &mut Vec<String>,
-                 start: &mut Option<i64>,
-                 end: &mut Option<i64>| {
-        if block.is_empty() {
-            return;
-        }
-        let (Some(s), Some(e)) = (*start, *end) else {
-            block.clear();
-            *start = None;
-            *end = None;
-            return;
-        };
-        let lo = s.max(start_ms);
-        let hi = match end_ms {
-            Some(limit) => e.min(limit),
-            None => e,
-        };
-        if hi > lo {
-            for line in block.iter() {
-                if line.starts_with("START=") {
-                    out.push_str(&format!("START={}\n", lo - start_ms));
-                } else if line.starts_with("END=") {
-                    out.push_str(&format!("END={}\n", hi - start_ms));
-                } else {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            }
-        }
-        block.clear();
-        *start = None;
-        *end = None;
-    };
 
     for line in text.lines() {
         if line.trim() == "[CHAPTER]" {
-            flush(&mut out, &mut block, &mut chapter_start, &mut chapter_end);
+            flush_chapter(&mut out, &mut block, start_s, duration_s);
             in_chapter = true;
             block.push(line.to_string());
             continue;
@@ -462,13 +422,65 @@ pub fn shift_ffmetadata(text: &str, start_s: f64, duration_s: Option<f64>) -> St
             out.push('\n');
             continue;
         }
-        if let Some(v) = line.strip_prefix("START=") {
-            chapter_start = v.trim().parse().ok();
-        } else if let Some(v) = line.strip_prefix("END=") {
-            chapter_end = v.trim().parse().ok();
-        }
         block.push(line.to_string());
     }
-    flush(&mut out, &mut block, &mut chapter_start, &mut chapter_end);
+    flush_chapter(&mut out, &mut block, start_s, duration_s);
     out
+}
+
+/// Emit one chapter block of an ffmetadata file shifted onto a segment, or
+/// nothing if the chapter falls outside it.
+///
+/// `START` and `END` are counted in the chapter's own `TIMEBASE`, which each
+/// chapter may set for itself and which defaults to milliseconds when absent,
+/// as ffmpeg's does. Reading them as milliseconds regardless put a chapter
+/// written at 1/90000 a hundred times too late. The segment's bounds are
+/// converted into that timebase rather than the other way round, so a chapter
+/// that is not moved keeps its values exactly.
+fn flush_chapter(out: &mut String, block: &mut Vec<String>, start_s: f64, duration_s: Option<f64>) {
+    if block.is_empty() {
+        return;
+    }
+    let value = |key: &str| {
+        block
+            .iter()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+    };
+    let timebase = value("TIMEBASE=")
+        .and_then(|tb| {
+            let (num, den) = tb.split_once('/')?;
+            let (num, den) = (num.trim().parse::<i64>().ok()?, den.trim().parse::<i64>().ok()?);
+            (num > 0 && den > 0).then_some((num, den))
+        })
+        .unwrap_or((1, 1000));
+    let start = value("START=").and_then(|v| v.parse::<i64>().ok());
+    let end = value("END=").and_then(|v| v.parse::<i64>().ok());
+    let (Some(s), Some(e)) = (start, end) else {
+        block.clear();
+        return;
+    };
+
+    // Seconds into this chapter's ticks.
+    let ticks = |secs: f64| (secs * timebase.1 as f64 / timebase.0 as f64).round() as i64;
+    let seg_start = ticks(start_s);
+    let seg_end = duration_s.map(|d| seg_start + ticks(d));
+    let lo = s.max(seg_start);
+    let hi = match seg_end {
+        Some(limit) => e.min(limit),
+        None => e,
+    };
+    if hi > lo {
+        for line in block.iter() {
+            if line.starts_with("START=") {
+                out.push_str(&format!("START={}\n", lo - seg_start));
+            } else if line.starts_with("END=") {
+                out.push_str(&format!("END={}\n", hi - seg_start));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    block.clear();
 }

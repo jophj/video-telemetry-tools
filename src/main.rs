@@ -107,7 +107,13 @@ fn strip_suffix_variant(video: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Render the viewer's JSON from a video, a CSV or a GPX.
+/// Render the viewer's JSON from a video or a CSV.
+///
+/// A GPX is refused by name. The viewer plays per-frame IMU channels against
+/// the video, and a GPX has positions at its receiver's own cadence and at
+/// most a lean angle -- nothing to fill the lean-rate, pitch and acceleration
+/// traces with, and no reliable tie to video frames. Read as a video instead,
+/// it failed with a complaint about MP4 boxes that said nothing useful.
 fn telemetry_json_from(
     path: &std::path::Path,
     max_dop: f64,
@@ -117,6 +123,13 @@ fn telemetry_json_from(
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
+    if ext == "gpx" {
+        anyhow::bail!(
+            "{} is a GPX, which the viewer cannot play: it needs the camera's per-frame \
+             channels. Pass the camera's video, or the CSV `gmax telemetry` writes from it",
+            path.display()
+        );
+    }
     let video_name = video
         .and_then(|v| v.file_name())
         .map(|s| s.to_string_lossy().to_string());
@@ -175,19 +188,23 @@ fn write_clip_telemetry(
     clip: &std::path::Path,
     planned: &gmax::moments::clips::Clip,
 ) -> Result<()> {
-    let (start, end) = match gmax::mp4::Mp4::open(clip)
+    let (from, to) = match gmax::mp4::Mp4::open(clip)
         .ok()
         .and_then(|mut f| gmax::gpmf::from_mp4(&mut f).ok())
         .and_then(|g| telemetry::timeline(&g))
         .filter(|t| t.len() > 1)
     {
-        Some(t) => (t[0], t[t.len() - 1]),
+        // The clip's GPMF keeps the parent's timestamps, so these are already
+        // on the parent's timeline.
+        Some(t) => parent.range_covering(t[0], t[t.len() - 1]),
         // No GPMF in the cut file, or timestamps that were not carried through:
         // fall back to the window that was asked for. Off by up to a keyframe
-        // interval, which is better than nothing to calibrate against.
-        None => (planned.start_s, planned.end_s),
+        // interval, which is better than nothing to calibrate against. That
+        // window was planned in video time, so it has to be moved onto the
+        // GPMF timeline; taken raw, it named the wrong stretch of any
+        // recording whose timeline does not start at zero.
+        None => parent.video_range(planned.start_s, planned.end_s),
     };
-    let (from, to) = parent.range_covering(start, end);
     if to <= from {
         anyhow::bail!("the clip's timeline does not overlap the source's");
     }
