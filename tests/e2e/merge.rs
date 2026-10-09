@@ -176,3 +176,125 @@ fn clips_with_gps_writes_the_repaired_positions_beside_the_clip() {
         }
     }
 }
+
+/// The phone's GPX with every speed element removed, as Strava and many phone
+/// loggers write it: positions and times only.
+fn phone_without_speeds(phone: &std::path::Path, dir: &Scratch) -> PathBuf {
+    let text = std::fs::read_to_string(phone).unwrap();
+    let stripped: String = text
+        .lines()
+        .filter(|l| !l.contains("<gpxtpx:speed>"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(!stripped.contains("speed>"), "a speed survived the stripping");
+    let out = dir.join("phone-no-speed.gpx");
+    std::fs::write(&out, stripped).unwrap();
+    out
+}
+
+#[test]
+fn a_fix_revived_from_a_track_without_speeds_keeps_neither_the_cameras_speed_nor_its_dop() {
+    // Regression: a rejected fix brought back by the merge took the external
+    // position but kept the camera's own speed and its 99.99 DOP whenever the
+    // external point had no speed, so a "valid" row carried the very numbers
+    // the receiver was rejected for.
+    let video = section_or_skip!("gps_dropout");
+    let Some(phone) = phone_or_skip() else { return };
+    if which("ffmpeg").is_none() {
+        eprintln!("SKIP: ffmpeg is not installed");
+        return;
+    }
+    let dir = Scratch::new("merge-no-speed");
+    let no_speed = phone_without_speeds(&phone, &dir);
+    let out = dir.join("out");
+    // A hand cut of the whole section, so the sibling CSV spans the dropout.
+    gmax_ok(argv![
+        "--quiet", "clips", &video, "--ss", "0", "--gps", &no_speed, "-o", &out
+    ]);
+    let sibling = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".telemetry.csv"))
+        .expect("no sibling telemetry");
+    let csv = Csv::read(&sibling);
+
+    let revived: Vec<usize> = (0..csv.len())
+        .filter(|&i| csv.str(i, "gps_source") == "external" && csv.str(i, "gps_valid") == "1")
+        .collect();
+    assert!(
+        revived.len() >= 50,
+        "only {} rows revived from the phone",
+        revived.len()
+    );
+    for &i in &revived {
+        assert_ne!(
+            csv.str(i, "gps_dop"),
+            "99.99",
+            "row {i} is valid with the camera's no-lock DOP"
+        );
+        // Either measured from the merged positions or honestly unknown; the
+        // section rides through the dropout at 57-69 km/h either side.
+        if let Some(v) = csv.num(i, "speed_kmh") {
+            assert!(
+                (25.0..110.0).contains(&v),
+                "row {i} claims {v} km/h in a 60 km/h corner"
+            );
+        }
+    }
+}
+
+#[test]
+fn points_filled_into_a_gpx_bases_gap_carry_video_time() {
+    // Regression: gap-filling slots of a GPX base had no video time, so
+    // `analyse --chapters` on the merged track dropped exactly the moments
+    // the merge was run to recover.
+    let video = section_or_skip!("gps_dropout");
+    let Some(phone) = phone_or_skip() else { return };
+    let dir = Scratch::new("merge-gpx-base");
+    let base = dir.join("base.gpx");
+    gmax_ok(argv!["--quiet", "gpx", &video, "-o", &base]);
+    let merged = dir.join("merged.gpx");
+    gmax_ok(argv![
+        "--quiet",
+        "merge",
+        &base,
+        "--with",
+        &phone,
+        "-o",
+        &merged,
+        "--time-offset",
+        PHONE_TIME_OFFSET_S,
+        "--no-gps-lag",
+    ]);
+    let gpx = read_gpx(&merged);
+    let external: Vec<_> = gpx
+        .points
+        .iter()
+        .filter(|p| p.source.as_deref() == Some("external"))
+        .collect();
+    assert!(
+        external.len() >= 50,
+        "only {} points filled into the base's gap",
+        external.len()
+    );
+    let mut last = f64::NEG_INFINITY;
+    for p in &gpx.points {
+        let vt = p
+            .video_time
+            .unwrap_or_else(|| panic!("a {:?} point has no video time", p.source));
+        assert!((0.0..17.0).contains(&vt), "video time {vt} outside the section");
+        assert!(vt > last, "video times go backwards at {vt}");
+        last = vt;
+    }
+
+    let chapters = dir.join("chapters.txt");
+    let run = gmax_ok(argv!["analyse", &merged, "--chapters", &chapters]);
+    assert!(
+        !run.stderr.contains("no video timestamp") && !run.stdout.contains("no video timestamp"),
+        "moments were dropped for want of a video time:\n{}{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(std::fs::read_to_string(&chapters).unwrap().contains("[CHAPTER]"));
+    validate_gpx(&merged);
+}

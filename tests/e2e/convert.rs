@@ -120,3 +120,70 @@ fn a_one_second_render_is_a_tagged_360_video_with_its_telemetry() {
         "{tags}"
     );
 }
+
+#[test]
+fn chapters_are_cut_to_the_render_in_their_own_timebase() {
+    // Regression: shifting chapters for --ss read every START/END as
+    // milliseconds whatever the chapter's TIMEBASE said, so a chapter in
+    // nanoseconds (as MKV tools export) was shifted by a millionth of the
+    // right amount and fell outside the render.
+    let video = section_or_skip!("corner_sequence");
+    if !tools_or_skip() {
+        return;
+    }
+    let dir = Scratch::new("convert-chapters");
+    let chapters = dir.join("chapters.txt");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n\
+         \n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2200\nEND=2600\ntitle=milliseconds\n\
+         \n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=3500000000\nEND=4200000000\ntitle=nanoseconds\n\
+         \n[CHAPTER]\nTIMEBASE=1/90000\nSTART=810000\nEND=900000\ntitle=after the render\n",
+    )
+    .unwrap();
+    let out = dir.join("chapters_equirect.mp4");
+    gmax_ok(argv![
+        "--quiet",
+        "convert",
+        &video,
+        "--ss",
+        "2",
+        "--duration",
+        "3",
+        "--size",
+        "480x240",
+        "-q",
+        "h264",
+        "--accel",
+        "cpu",
+        "--chapters",
+        &chapters,
+        "-o",
+        &out,
+    ]);
+
+    let shown = Command::new("ffprobe")
+        .args(["-v", "error", "-show_chapters", "-of", "json"])
+        .arg(&out)
+        .output()
+        .expect("run ffprobe");
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let got: Vec<(String, f64)> = json["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["tags"]["title"].as_str().unwrap_or("").to_string(),
+                c["start_time"].as_str().unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    let titles: Vec<_> = got.iter().map(|(t, _)| t.as_str()).collect();
+    // The chapter past the end of the render is dropped; both others survive.
+    assert_eq!(titles, ["milliseconds", "nanoseconds"], "{got:?}");
+    // MP4 chapters store only where each starts, and the muxer pins the first
+    // to zero, so the second is the one whose shift can be checked: 3.5 s in
+    // the section, 1.5 s into a render that begins at 2 s.
+    assert!((got[1].1 - 1.5).abs() < 0.15, "nanosecond chapter starts at {}", got[1].1);
+}
