@@ -1234,6 +1234,10 @@ pub fn compute(gpmf: &Gpmf, opts: &Options) -> anyhow::Result<Telemetry> {
 ///
 /// Without usable GPS, stage 1 cannot run and the convention is *assumed*
 /// rather than confirmed; the confidence reported says so.
+/// The weakest GPS course-rate correlation trusted to overrule the gyro's
+/// documented handedness.
+const CONVENTION_FLOOR: f64 = 0.25;
+
 fn resolve_lean_sign(
     lean: &[f64],
     turn_rate_right: &[f64],
@@ -1278,7 +1282,13 @@ fn resolve_lean_sign(
     // is wrong for this camera; invert the reference before using it. The
     // caller is told, because the reference is not the only thing read from
     // the gyro: yaw rate and pitch rate are wrong in the same way.
-    let turn_rate_inverted = r_convention < 0.0;
+    //
+    // Only a disagreement GPS is sure of counts. A short or patchy stretch of
+    // fixes can clear the sample count and still correlate at r = -0.1, whose
+    // sign is noise; following it mirrored a 30° right-hander into a left one.
+    // Below the floor the documented convention is the better bet, and the
+    // confidence below says it was not confirmed.
+    let turn_rate_inverted = r_convention <= -CONVENTION_FLOOR;
     let reference: Vec<f64> = if turn_rate_inverted {
         turn_rate_right.iter().map(|v| -v).collect()
     } else {
@@ -1299,7 +1309,7 @@ fn resolve_lean_sign(
     let flipped = r_lean < 0.0;
 
     // Confidence is limited by the weaker of the two links in the chain.
-    let confidence = if r_convention.abs() >= 0.25 && r_lean.abs() >= 0.5 {
+    let confidence = if r_convention.abs() >= CONVENTION_FLOOR && r_lean.abs() >= 0.5 {
         Confidence::High
     } else {
         Confidence::Low

@@ -424,10 +424,6 @@ fn moving_sections_sign_lean_and_yaw_rate_the_way_the_ride_does() {
 }
 
 #[test]
-#[ignore = "bug: on gps_dropout, lean and yaw rate come out mirrored (r = -1.00 and -0.99 \
-            against the ride; the 30° right-hander reads 31° left). resolve_lean_sign trusts \
-            the sign of a GPS course-rate correlation of r = -0.100, below its own 0.25 \
-            confidence floor, and inverts the turn-rate reference on it"]
 fn gps_dropout_signs_lean_and_yaw_rate_the_way_the_ride_does() {
     let Some((r_lean, r_yaw)) = sign_agreement("gps_dropout") else {
         return;
