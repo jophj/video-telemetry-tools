@@ -71,6 +71,23 @@ comes out level — over just the rendered segment when `--ss`/`--duration`
 select one, since the whole ride's mean can be degrees off for any one stretch. `--heading D` then turns the view about the vertical to choose
 what the centre of the frame looks at; the two are independent.
 
+The reprojection from cubemap to equirectangular runs on the GPU when it can.
+On the CPU, ffmpeg's `v360` filter is about three quarters of a conversion: it
+held an i7-14700K at 22 fps on 11 of its 28 threads. ffmpeg's own
+`v360_vulkan` takes no cubemap input, so `gmax` writes the same transform as a
+libplacebo shader. It ports `v360`'s face order, face rotations, pad, rotation
+quaternion and lanczos kernel, and agrees with `v360` at 65 dB PSNR, which is
+10-bit rounding. On an RTX 4080 with `hevc_nvenc`, that took a 39 s clip from
+54 s to 21.5 s and a 121 s clip from 167 s to 61 s, using a fifth of the CPU
+time. The crops and seam blends still run on the CPU, and are now most of what
+is left.
+
+`--reproject auto` (the default) uses the GPU when ffmpeg has libplacebo and a
+Vulkan device can run the shader, and the CPU otherwise. `--reproject gpu`
+makes that a requirement, and `--reproject cpu` keeps `v360`. Only the `near`,
+`linear` and `lanczos` interpolations are ported. Any other `--interp` runs on
+the CPU under `auto` and is an error under `gpu`.
+
 The GPMF telemetry track is copied into the output by default, so `gmax
 telemetry` and `gmax analyse` work on a stitched file exactly as on the
 original.

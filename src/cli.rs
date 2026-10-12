@@ -236,6 +236,15 @@ pub struct ConvertArgs {
     #[arg(long, default_value = "lanczos")]
     pub interp: String,
 
+    /// Where the cubemap is reprojected to equirectangular.
+    ///
+    /// The reprojection is most of a conversion's time on the CPU. On the GPU
+    /// it runs through libplacebo, which needs an ffmpeg built with it and a
+    /// Vulkan device, and offers the near, linear and lanczos interpolations.
+    /// auto uses the GPU when both hold and falls back to the CPU otherwise.
+    #[arg(long, value_enum, default_value_t = ReprojectArg::Auto)]
+    pub reproject: ReprojectArg,
+
     /// Output size as WxH. Defaults to the native angular resolution, which is
     /// four cube faces across.
     #[arg(long, value_name = "WxH")]
@@ -295,6 +304,16 @@ pub enum PresetArg {
     Prores,
     /// H.264, for maximum compatibility.
     H264,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReprojectArg {
+    /// The GPU if it works here, otherwise the CPU.
+    Auto,
+    /// The GPU, or fail.
+    Gpu,
+    /// ffmpeg's v360, on the CPU.
+    Cpu,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
