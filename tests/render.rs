@@ -113,6 +113,7 @@ fn the_filter_graph_has_the_shape_the_layout_requires() {
         "lanczos",
         "yuv444p",
         None,
+        render::Reprojection::Cpu,
     );
 
     // Both discovered video indices are used, not indices 0 and 1.
@@ -147,8 +148,113 @@ fn the_filter_graph_has_the_shape_the_layout_requires() {
         "lanczos",
         "yuv444p",
         None,
+        render::Reprojection::Cpu,
     );
     assert!(!plain.contains("yaw="));
+}
+
+#[test]
+fn the_gpu_graph_hands_the_cubemap_to_libplacebo_instead_of_v360() {
+    let layout = render::Layout {
+        video: vec![0, 5],
+        audio: Some(1),
+        ambisonic: None,
+        gpmd: Some(4),
+        timecode: vec![],
+        geometry: Geometry::derive(3008, 960).unwrap(),
+        frame_rate: 30000.0 / 1001.0,
+    };
+    let rotation = Rotation { yaw: 2.0, pitch: 117.0, roll: 0.0 };
+    let g = render::filter_graph(
+        &layout,
+        3840,
+        1920,
+        rotation,
+        "pry",
+        "lanczos",
+        "yuv444p10le",
+        None,
+        render::Reprojection::Gpu { shader: "/tmp/s.hook", format: "p010le" },
+    );
+    // The stitch up to the cubemap is unchanged.
+    assert!(g.contains("[row0][row1]vstack=2[eac]"));
+    assert_eq!(g.matches("blend=all_expr=").count(), 4);
+    // The shader carries the rotation, so none is passed as an option, and
+    // the output arrives in the encoder's own format.
+    assert!(!g.contains("v360="));
+    assert!(!g.contains("yaw="));
+    assert!(g.ends_with(
+        "[eac]libplacebo=w=3840:h=1920:format=p010le:dithering=none:\
+         custom_shader_path=/tmp/s.hook[vout]"
+    ));
+
+    // VAAPI still gets its upload after the transform.
+    let g = render::filter_graph(
+        &layout,
+        3840,
+        1920,
+        rotation,
+        "pry",
+        "lanczos",
+        "yuv444p10le",
+        Some("p010"),
+        render::Reprojection::Gpu { shader: "/tmp/s.hook", format: "p010" },
+    );
+    assert!(g.ends_with("custom_shader_path=/tmp/s.hook,format=p010,hwupload[vout]"));
+}
+
+#[test]
+fn the_gpu_rotation_is_v360s_quaternion() {
+    use render::gpu::quaternion;
+    let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+
+    assert_eq!(quaternion(Rotation::default(), "pry"), [1.0, 0.0, 0.0, 0.0]);
+    // A single axis is its own half-angle quaternion: yaw about y, pitch
+    // about x, roll about z.
+    let h = 45f32.to_radians();
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let yaw = Rotation { yaw: 90.0, ..Default::default() };
+    let pitch = Rotation { pitch: 90.0, ..Default::default() };
+    let roll = Rotation { roll: 90.0, ..Default::default() };
+    assert!(close(quaternion(yaw, "pry"), [h.cos(), 0.0, s, 0.0]));
+    assert!(close(quaternion(pitch, "pry"), [s, s, 0.0, 0.0]));
+    assert!(close(quaternion(roll, "pry"), [s, 0.0, 0.0, s]));
+
+    // Order matters, and pry composes pitch first: pitch * yaw, not yaw * pitch.
+    let both = Rotation { yaw: 90.0, pitch: 90.0, roll: 0.0 };
+    assert!(close(quaternion(both, "pry"), [0.5, 0.5, 0.5, 0.5]));
+    assert!(close(quaternion(both, "ypr"), [0.5, 0.5, 0.5, -0.5]));
+    // v360 falls back to ypr on a malformed order, and so does the shader.
+    assert_eq!(quaternion(both, "pq"), quaternion(both, "ypr"));
+}
+
+#[test]
+fn the_gpu_shader_offers_only_the_interpolations_it_ports() {
+    use render::gpu::{shader, Interp};
+    assert_eq!(Interp::parse("lanczos"), Some(Interp::Lanczos));
+    assert_eq!(Interp::parse("lanc"), Some(Interp::Lanczos));
+    assert_eq!(Interp::parse("line"), Some(Interp::Linear));
+    assert_eq!(Interp::parse("near"), Some(Interp::Nearest));
+    // Not ported: these must go to the CPU rather than be quietly swapped.
+    assert_eq!(Interp::parse("cubic"), None);
+    assert_eq!(Interp::parse("spline16"), None);
+
+    let s = shader(3840, 1920, 2880, 1920, Rotation::default(), "pry", Interp::Lanczos);
+    assert!(s.starts_with("//!HOOK MAIN\n"));
+    assert!(s.contains("//!WIDTH 3840\n//!HEIGHT 1920\n"));
+    assert!(s.contains("const vec2 ATLAS = vec2(2880.0, 1920.0);"));
+    assert!(s.contains("return lanczos(p);"));
+    let s = shader(3840, 1920, 2880, 1920, Rotation::default(), "pry", Interp::Linear);
+    assert!(s.contains("return HOOKED_tex(p);"));
+}
+
+#[test]
+fn a_shader_path_ffmpeg_would_misparse_is_refused() {
+    use render::gpu::path_is_graph_safe;
+    assert!(path_is_graph_safe("/tmp/gmax-eac-123.hook"));
+    for bad in ["C:\\tmp\\a.hook", "/tmp/a b.hook", "/tmp/a,b.hook", "/tmp/it's.hook", "/t[1]/a.hook"] {
+        assert!(!path_is_graph_safe(bad), "{bad}");
+    }
 }
 
 #[test]

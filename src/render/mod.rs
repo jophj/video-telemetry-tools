@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::ffmpeg::{encoders, file_url, Encoder, Ffmpeg, Kind, Preset};
 use crate::math::*;
 
+pub mod gpu;
+
 /// Frame layout of one `.360` video track.
 #[derive(Debug, Clone, Copy)]
 pub struct Geometry {
@@ -373,6 +375,25 @@ pub fn mean_gravity_in(
     Ok((scale(&sum, 1.0 / n as f64), n))
 }
 
+/// Where the cubemap is reprojected to equirectangular.
+#[derive(Debug, Clone, Copy)]
+pub enum Reprojection<'a> {
+    /// ffmpeg's `v360`, on the CPU.
+    Cpu,
+    /// The [`gpu`] shader, run by `libplacebo`, which hands back `format`.
+    Gpu { shader: &'a str, format: &'a str },
+}
+
+/// Which reprojection a conversion asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reproject {
+    /// The GPU when it works here and can do the requested interpolation,
+    /// otherwise the CPU.
+    Auto,
+    Gpu,
+    Cpu,
+}
+
 /// Build the stitching filter graph.
 ///
 /// Each split face is reassembled from four crops: the two outer segments, and
@@ -391,6 +412,7 @@ pub fn filter_graph(
     interp: &str,
     work_fmt: &str,
     hw_upload: Option<&str>,
+    reproject: Reprojection,
 ) -> String {
     let g = layout.geometry;
     let (face, ovl, seg, panel) = (g.face, g.overlap, g.segment, g.panel);
@@ -442,15 +464,26 @@ pub fn filter_graph(
     parts.push("[FD][FB][FU]hstack=3[row1]".to_string());
     parts.push("[row0][row1]vstack=2[eac]".to_string());
 
-    let mut v360 = format!(
-        "[eac]v360=input=eac:output=e:w={out_w}:h={out_h}:interp={interp}"
-    );
-    if !rotation.is_zero() {
-        v360.push_str(&format!(
-            ":yaw={:.4}:pitch={:.4}:roll={:.4}:rorder={rorder}",
-            rotation.yaw, rotation.pitch, rotation.roll
-        ));
-    }
+    let mut v360 = match reproject {
+        Reprojection::Cpu => {
+            let mut f = format!("[eac]v360=input=eac:output=e:w={out_w}:h={out_h}:interp={interp}");
+            if !rotation.is_zero() {
+                f.push_str(&format!(
+                    ":yaw={:.4}:pitch={:.4}:roll={:.4}:rorder={rorder}",
+                    rotation.yaw, rotation.pitch, rotation.roll
+                ));
+            }
+            f
+        }
+        // The shader carries the rotation and the interpolation itself. Its
+        // output is converted straight to the format the encoder takes, so
+        // that conversion runs on the GPU too; and without dithering, so the
+        // picture is the one v360 would have made.
+        Reprojection::Gpu { shader, format } => format!(
+            "[eac]libplacebo=w={out_w}:h={out_h}:format={format}:dithering=none:\
+             custom_shader_path={shader}"
+        ),
+    };
     if let Some(pix) = hw_upload {
         // VAAPI encodes from GPU memory, so the frames have to be uploaded
         // after the transform rather than before it.
@@ -476,6 +509,10 @@ pub struct ConvertOptions {
     pub level: bool,
     pub rorder: String,
     pub interp: String,
+    pub reproject: Reproject,
+    /// The GPU shader file, once [`Reproject`] has been resolved to the GPU.
+    /// `None` reprojects on the CPU.
+    pub gpu_shader: Option<PathBuf>,
     /// Output size, defaulting to the native angular resolution.
     pub size: Option<(u32, u32)>,
     pub start_s: Option<f64>,
@@ -501,6 +538,8 @@ impl Default for ConvertOptions {
             level: false,
             rorder: ROTATION_ORDER.into(),
             interp: "lanczos".into(),
+            reproject: Reproject::Auto,
+            gpu_shader: None,
             size: None,
             start_s: None,
             duration_s: None,
@@ -555,6 +594,16 @@ fn stitch_args(
     // Only a real encode can use VAAPI; a preview's JPEG is written from
     // system memory, and an uploaded frame would have nowhere to go.
     let vaapi = encoder.filter(|e| e.name.ends_with("_vaapi"));
+    let shader = opts.gpu_shader.as_ref().map(|p| p.display().to_string());
+    let reproject = match &shader {
+        None => Reprojection::Cpu,
+        Some(shader) => Reprojection::Gpu {
+            shader,
+            // What the encoder takes, so nothing is left to convert after
+            // the download; a preview's JPEG takes the working format.
+            format: encoder.map_or(working_format(None), |e| e.pix_fmt),
+        },
+    };
     let graph = filter_graph(
         layout,
         out_w,
@@ -564,6 +613,7 @@ fn stitch_args(
         &opts.interp,
         working_format(encoder),
         vaapi.map(|e| e.pix_fmt),
+        reproject,
     );
 
     let mut a: Vec<String> = vec!["-hide_banner".into()];

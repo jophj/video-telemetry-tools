@@ -4,7 +4,7 @@ use std::process::Command;
 
 use crate::common::sections::section_or_skip;
 use crate::common::which;
-use crate::support::{argv, gmax_ok, probe, probe_duration, streams, Scratch};
+use crate::support::{argv, gmax, gmax_ok, probe, probe_duration, streams, Scratch};
 
 fn tools_or_skip() -> bool {
     if which("ffmpeg").is_none() || which("ffprobe").is_none() {
@@ -186,4 +186,49 @@ fn chapters_are_cut_to_the_render_in_their_own_timebase() {
     // to zero, so the second is the one whose shift can be checked: 3.5 s in
     // the section, 1.5 s into a render that begins at 2 s.
     assert!((got[1].1 - 1.5).abs() < 0.15, "nanosecond chapter starts at {}", got[1].1);
+}
+
+#[test]
+fn the_gpu_reprojection_draws_the_frame_v360_draws() {
+    // The GPU shader is a port of v360's geometry, so a wrong face order, face
+    // rotation or quaternion would still produce a plausible-looking sphere.
+    // Comparing against v360 itself is what catches that: a levelled frame,
+    // both ways, at lanczos.
+    let video = section_or_skip!("hard_corner");
+    if !tools_or_skip() {
+        return;
+    }
+    let dir = Scratch::new("convert-gpu");
+    let (cpu, gpu) = (dir.join("cpu.png"), dir.join("gpu.png"));
+    let preview = |reproject: &str, out: &std::path::Path| {
+        gmax(argv![
+            "--quiet", "convert", &video, "--preview", "--ss", "6", "--level",
+            "--reproject", reproject, "-o", out
+        ])
+    };
+    let run = preview("gpu", &gpu);
+    if !run.ok {
+        eprintln!("SKIP: no GPU reprojection here: {}", run.stderr.trim());
+        return;
+    }
+    assert!(preview("cpu", &cpu).ok);
+
+    let out = Command::new(which("ffmpeg").unwrap())
+        .args(["-hide_banner", "-i"])
+        .arg(&gpu)
+        .arg("-i")
+        .arg(&cpu)
+        .args(["-lavfi", "[0][1]psnr", "-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let log = String::from_utf8_lossy(&out.stderr);
+    let psnr: f64 = log
+        .split("average:")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no PSNR in {log}"));
+    // 8-bit rounding leaves the two in the 50s; a geometric slip of even one
+    // face drops this under 20.
+    assert!(psnr > 45.0, "GPU frame differs from v360's at {psnr:.1} dB");
 }

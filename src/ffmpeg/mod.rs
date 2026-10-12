@@ -266,6 +266,38 @@ impl Ffmpeg {
         self.run_with_deadline(&args, PROBE_DEADLINE)
     }
 
+    /// Whether `libplacebo` can run a reprojection shader here.
+    ///
+    /// The real shader is run, once, on a blank frame of the real atlas size:
+    /// an ffmpeg built without libplacebo, a machine with no Vulkan device, a
+    /// driver that cannot compile the shader and a shader this libplacebo
+    /// rejects all fail the same way, which is the one answer wanted.
+    pub fn test_libplacebo(&self, shader: &Path, atlas: (u32, u32), out: (u32, u32)) -> bool {
+        let args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostdin".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            format!("color=c=black:s={}x{}:r=1:d=1,format=yuv444p", atlas.0, atlas.1),
+            "-vf".into(),
+            format!(
+                "libplacebo=w={}:h={}:format=yuv444p:dithering=none:custom_shader_path={}",
+                out.0,
+                out.1,
+                shader.display()
+            ),
+            "-frames:v".into(),
+            "1".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ];
+        self.run_with_deadline(&args, PROBE_DEADLINE)
+    }
+
     /// Run ffmpeg quietly, killing it if it outlives `deadline`.
     ///
     /// Only for probes, whose output is not wanted: a real encode can

@@ -498,9 +498,9 @@ fn cmd_clips(args: &gmax::cli::ClipsArgs, quiet: bool) -> Result<()> {
 }
 
 fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
-    use gmax::cli::{AccelArg, AudioArg, PresetArg};
+    use gmax::cli::{AccelArg, AudioArg, PresetArg, ReprojectArg};
     use gmax::ffmpeg::{encoders, Ffmpeg, Kind, Preset};
-    use gmax::render::{self, Audio, ConvertOptions, Rotation};
+    use gmax::render::{self, Audio, ConvertOptions, Reproject, Rotation};
 
     if let Some(out) = &args.out {
         gmax::cli::refuse_to_overwrite(&args.input, out)?;
@@ -577,6 +577,12 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
         level: args.level,
         rorder: args.rorder.clone(),
         interp: args.interp.clone(),
+        reproject: match args.reproject {
+            ReprojectArg::Auto => Reproject::Auto,
+            ReprojectArg::Gpu => Reproject::Gpu,
+            ReprojectArg::Cpu => Reproject::Cpu,
+        },
+        gpu_shader: None,
         size,
         start_s: args.ss,
         duration_s: args.duration,
@@ -661,6 +667,18 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
         }
     }
 
+    // The shader is written before the probe, which runs it, and has to
+    // outlive the ffmpeg run that reads it. A dry run keeps it, since the
+    // command it prints names it.
+    let mut _shader: Option<TempFile> = None;
+    let shader_path = std::env::temp_dir().join(format!("gmax-eac-{}.hook", std::process::id()));
+    if let Some(path) = gpu_reprojection(&ff, &layout, &opts, (w, h), &shader_path)? {
+        if !args.dry_run {
+            _shader = Some(TempFile(path.clone()));
+        }
+        opts.gpu_shader = Some(path);
+    }
+
     let cmd = match encoder {
         None => render::preview_args(&layout, &args.input, &output, &opts),
         Some(e) => render::convert_args(
@@ -680,14 +698,15 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
 
     let (w, h) = opts.size.unwrap_or_else(|| layout.geometry.native_output());
     if !quiet {
+        let on = if opts.gpu_shader.is_some() { "GPU" } else { "CPU" };
         match encoder {
             Some(e) => println!(
-                "stitching {} to {w}x{h} with {} ({})",
+                "stitching {} to {w}x{h} with {} ({}), reprojecting on the {on}",
                 args.input.display(),
                 e.name,
                 e.kind.as_str()
             ),
-            None => println!("previewing {} at {w}x{h}", args.input.display()),
+            None => println!("previewing {} at {w}x{h}, reprojecting on the {on}", args.input.display()),
         }
     }
     ff.run_streaming(&cmd)?;
@@ -720,6 +739,74 @@ fn cmd_convert(args: &gmax::cli::ConvertArgs, quiet: bool) -> Result<()> {
 }
 
 /// A temporary file that is deleted when it goes out of scope.
+/// Settle where a conversion reprojects, writing the GPU shader to `path`
+/// when it is the GPU. `None` means the CPU.
+///
+/// The interpolation is checked first, since no probe can rescue an
+/// unported one. `auto` falls back to the CPU on any failure, saying why
+/// only when the reason is not simply that this machine lacks the means.
+fn gpu_reprojection(
+    ff: &gmax::ffmpeg::Ffmpeg,
+    layout: &gmax::render::Layout,
+    opts: &gmax::render::ConvertOptions,
+    out: (u32, u32),
+    path: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>> {
+    use gmax::render::{gpu, Reproject};
+
+    let explicit = match opts.reproject {
+        Reproject::Cpu => return Ok(None),
+        Reproject::Gpu => true,
+        Reproject::Auto => false,
+    };
+    let Some(interp) = gpu::Interp::parse(&opts.interp) else {
+        if explicit {
+            anyhow::bail!(
+                "--interp {} has no GPU implementation; use near, linear or lanczos, or \
+                 --reproject cpu",
+                opts.interp
+            );
+        }
+        return Ok(None);
+    };
+    let text = path.display().to_string();
+    if !gpu::path_is_graph_safe(&text) {
+        let why = format!(
+            "the temporary directory's path ({text}) has characters ffmpeg's filter syntax \
+             would need escaped; point TMPDIR somewhere plainer"
+        );
+        if explicit {
+            anyhow::bail!(why);
+        }
+        eprintln!("gmax: warning: reprojecting on the CPU: {why}");
+        return Ok(None);
+    }
+
+    let face = layout.geometry.face;
+    let atlas = (3 * face, 2 * face);
+    let shader = gpu::shader(
+        out.0,
+        out.1,
+        atlas.0,
+        atlas.1,
+        opts.rotation.unwrap_or_default(),
+        &opts.rorder,
+        interp,
+    );
+    std::fs::write(path, shader).with_context(|| format!("writing {}", path.display()))?;
+    if ff.test_libplacebo(path, atlas, out) {
+        return Ok(Some(path.to_path_buf()));
+    }
+    let _ = std::fs::remove_file(path);
+    if explicit {
+        anyhow::bail!(
+            "libplacebo could not run the reprojection shader: this ffmpeg may be built \
+             without it, or there is no working Vulkan device. Use --reproject cpu."
+        );
+    }
+    Ok(None)
+}
+
 struct TempFile(std::path::PathBuf);
 
 impl Drop for TempFile {
